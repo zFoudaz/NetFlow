@@ -1,0 +1,13 @@
+﻿# Build & deps
+target/
+node_modules/
+dist/
+
+# Bundled large binaries (fetched via scripts/fetch-sidecars.ps1)
+src-tauri/binaries/*.exe
+src-tauri/resources/*.dll
+
+# Local dev / SDD scratch
+.superpowers/
+.worktrees/
+spike/
