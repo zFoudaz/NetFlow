@@ -165,8 +165,60 @@ export interface NetFlowStoreState {
   toggleTrafficDrawer: () => void;
   dismissRecoveryNotice: () => void;
   clearUiError: () => void;
+  hydrateCanvasDraft: () => void;
   initEventListeners: () => Promise<() => void>;
   resetStore: () => void;
+}
+
+const CANVAS_DRAFT_STORAGE_KEY = "netflow.canvasDraft.v1";
+
+interface CanvasDraftPayload {
+  currentWorkflowId: string | null;
+  currentWorkflowName: string;
+  graph: WorkflowGraph;
+  isDirty: boolean;
+}
+
+function readCanvasDraft(): CanvasDraftPayload | null {
+  try {
+    const raw = globalThis.localStorage?.getItem(CANVAS_DRAFT_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<CanvasDraftPayload>;
+    if (
+      !parsed ||
+      typeof parsed.currentWorkflowName !== "string" ||
+      !parsed.graph ||
+      !Array.isArray(parsed.graph.nodes) ||
+      !Array.isArray(parsed.graph.edges)
+    ) {
+      return null;
+    }
+    return {
+      currentWorkflowId:
+        typeof parsed.currentWorkflowId === "string" ? parsed.currentWorkflowId : null,
+      currentWorkflowName: parsed.currentWorkflowName,
+      graph: cloneGraph(parsed.graph),
+      isDirty: Boolean(parsed.isDirty),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeCanvasDraft(payload: CanvasDraftPayload): void {
+  try {
+    globalThis.localStorage?.setItem(CANVAS_DRAFT_STORAGE_KEY, JSON.stringify(payload));
+  } catch {
+    // Ignore storage quota/unavailable errors
+  }
+}
+
+function clearCanvasDraft(): void {
+  try {
+    globalThis.localStorage?.removeItem(CANVAS_DRAFT_STORAGE_KEY);
+  } catch {
+    // Ignore storage unavailable errors
+  }
 }
 
 export const useNetFlowStore = create<NetFlowStoreState>((set, get) => ({
@@ -634,7 +686,22 @@ export const useNetFlowStore = create<NetFlowStoreState>((set, get) => ({
     };
   },
 
+  hydrateCanvasDraft: () => {
+    const draft = readCanvasDraft();
+    if (!draft) return;
+    if (draft.graph.nodes.length === 0 && draft.graph.edges.length === 0 && !draft.currentWorkflowId) {
+      return;
+    }
+    set({
+      currentWorkflowId: draft.currentWorkflowId,
+      currentWorkflowName: draft.currentWorkflowName,
+      graph: cloneGraph(draft.graph),
+      isDirty: draft.isDirty,
+    });
+  },
+
   resetStore: () => {
+    clearCanvasDraft();
     set({
       discovery: EMPTY_DISCOVERY,
       workflows: [],
@@ -652,3 +719,19 @@ export const useNetFlowStore = create<NetFlowStoreState>((set, get) => ({
     });
   },
 }));
+
+useNetFlowStore.subscribe((state, prevState) => {
+  if (
+    state.graph !== prevState.graph ||
+    state.currentWorkflowId !== prevState.currentWorkflowId ||
+    state.currentWorkflowName !== prevState.currentWorkflowName ||
+    state.isDirty !== prevState.isDirty
+  ) {
+    writeCanvasDraft({
+      currentWorkflowId: state.currentWorkflowId,
+      currentWorkflowName: state.currentWorkflowName,
+      graph: state.graph,
+      isDirty: state.isDirty,
+    });
+  }
+});

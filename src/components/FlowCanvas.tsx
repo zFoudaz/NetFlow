@@ -11,13 +11,15 @@ import {
   type Connection,
   type Edge,
   type EdgeChange,
+  type EdgeTypes,
   type IsValidConnection,
   type NodeChange,
   type NodeTypes,
 } from "@xyflow/react";
-import { useCallback, useEffect, useRef, useState, type DragEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type DragEvent, type MouseEvent } from "react";
 import { useNetFlowStore } from "../store/useNetFlowStore";
 import type { EngineStatus, WorkflowEdge, WorkflowNode } from "../types/workflow";
+import { DeletableEdge } from "./edges/DeletableEdge";
 import { AppsNode, type AppsFlowNode } from "./nodes/AppsNode";
 import { InterfaceNode, type InterfaceFlowNode } from "./nodes/InterfaceNode";
 import {
@@ -33,6 +35,10 @@ const nodeTypes: NodeTypes = {
   interface: InterfaceNode as NodeTypes[string],
   vpn: VpnNode as NodeTypes[string],
   apps: AppsNode as NodeTypes[string],
+};
+
+const edgeTypes: EdgeTypes = {
+  deletable: DeletableEdge,
 };
 
 function createsCycle(
@@ -164,7 +170,8 @@ function toFlowEdges(
       id: wfEdge.id,
       source: wfEdge.source,
       target: wfEdge.target,
-      type: "smoothstep",
+      type: "deletable",
+      interactionWidth: 24,
       animated: isActive,
       selected: prev?.selected,
       style: {
@@ -339,6 +346,19 @@ function FlowCanvasInner() {
     [addNode, screenToFlowPosition]
   );
 
+  const onEdgeContextMenu = useCallback(
+    (event: MouseEvent, edge: Edge) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const latestGraph = useNetFlowStore.getState().graph;
+      const nextEdges = latestGraph.edges.filter((e) => e.id !== edge.id);
+      if (nextEdges.length !== latestGraph.edges.length) {
+        updateGraph(latestGraph.nodes, nextEdges);
+      }
+    },
+    [updateGraph]
+  );
+
   return (
     <div
       data-testid="flow-canvas-dropzone"
@@ -350,8 +370,10 @@ function FlowCanvasInner() {
         nodes={rfNodes}
         edges={rfEdges}
         nodeTypes={nodeTypes}
+        edgeTypes={edgeTypes}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
+        onEdgeContextMenu={onEdgeContextMenu}
         onConnect={onConnect}
         isValidConnection={isValidConnection}
         deleteKeyCode={["Backspace", "Delete"]}

@@ -174,6 +174,7 @@ pub fn compile_singbox_config(input: &CompileInput) -> Result<CompiledConfig, Co
 
     let log_section = build_log_section(&input.log_path);
     let dns_section = build_dns_section(
+        &input.validated,
         default_iface,
         &interface_outbounds,
         &vpn_outbounds,
@@ -405,6 +406,7 @@ fn resolve_dns_final_tag<'a>(
 }
 
 fn build_dns_section(
+    validated: &ValidatedGraph,
     default_iface: &str,
     interface_outbounds: &[InterfaceOutbound],
     vpn_outbounds: &[ResolvedVpnOutbound],
@@ -447,20 +449,37 @@ fn build_dns_section(
         "inet4_range": FAKEIP_INET4_RANGE
     }));
 
+    let mut rules = vec![json!({
+        "query_type": ["AAAA", "HTTPS", "SVCB"],
+        "action": "predefined",
+        "rcode": "NOERROR"
+    })];
+
+    // VPN daemon processes (WARP, Karing, OpenVPN) must receive real IPv4 DNS
+    // answers bound to their root physical interface rather than FakeIPs,
+    // otherwise their endpoint health checks and local SOCKS5 dials fail.
+    for chain in &validated.vpn_chains {
+        let real_dns_tag = interface_outbounds
+            .iter()
+            .find(|iface| iface.alias.eq_ignore_ascii_case(&chain.root_interface_alias))
+            .map(|iface| iface.dns_tag.as_str())
+            .unwrap_or(DNS_DEFAULT_TAG);
+        rules.push(json!({
+            "process_name": outer_tunnel_processes(chain.provider),
+            "action": "route",
+            "server": real_dns_tag
+        }));
+    }
+
+    rules.push(json!({
+        "query_type": ["A"],
+        "action": "route",
+        "server": DNS_FAKEIP_TAG
+    }));
+
     json!({
         "servers": servers,
-        "rules": [
-            {
-                "query_type": ["AAAA", "HTTPS", "SVCB"],
-                "action": "predefined",
-                "rcode": "NOERROR"
-            },
-            {
-                "query_type": ["A"],
-                "action": "route",
-                "server": DNS_FAKEIP_TAG
-            }
-        ],
+        "rules": rules,
         "strategy": "ipv4_only",
         "final": dns_final_tag
     })
@@ -645,7 +664,7 @@ fn vpn_outbound_tag(provider: VpnProvider) -> &'static str {
 fn outer_tunnel_processes(provider: VpnProvider) -> &'static [&'static str] {
     match provider {
         VpnProvider::Karing => &["karingservice.exe", "karing.exe"],
-        VpnProvider::CloudflareWarp => &["warp-svc.exe"],
+        VpnProvider::CloudflareWarp => &["warp-svc.exe", "cloudflare warp.exe"],
         VpnProvider::OpenVpn => &["openvpn.exe", "ovpnconnector.exe"],
     }
 }
@@ -1531,5 +1550,48 @@ mod tests {
                 downstream_node_id: "vpn-ovpn".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn test_vpn_daemon_processes_bypass_fakeip_for_real_dns() {
+        let graph = WorkflowGraph {
+            nodes: vec![
+                iface_node("if-wifi", "Wi-Fi", false),
+                vpn_node("vpn-warp", VpnProvider::CloudflareWarp, true, WarpMode::Proxy),
+            ],
+            edges: vec![edge("e1", "if-wifi", "vpn-warp")],
+        };
+
+        let validated = validate_graph(&graph).expect("graph should validate");
+        let mut vpn_runtime = HashMap::new();
+        vpn_runtime.insert(VpnProvider::CloudflareWarp, warp_proxy_runtime(40000));
+
+        let compiled = compile_singbox_config(&CompileInput {
+            validated,
+            default_physical_interface: "Wi-Fi".to_string(),
+            vpn_runtime,
+            clash_api_port: 19090,
+            log_path: PathBuf::from("sing-box.log"),
+        })
+        .expect("compilation should succeed");
+
+        let dns_rules = compiled.json["dns"]["rules"]
+            .as_array()
+            .expect("dns.rules array");
+
+        let warp_dns_idx = dns_rules
+            .iter()
+            .position(|r| rule_has_process(r, "warp-svc.exe"))
+            .expect("warp-svc.exe must have a real DNS rule");
+        let fakeip_idx = dns_rules
+            .iter()
+            .position(|r| r["server"] == DNS_FAKEIP_TAG)
+            .expect("fakeip rule must exist");
+
+        assert!(
+            warp_dns_idx < fakeip_idx,
+            "VPN daemon DNS rule must precede FakeIP rule so WARP never receives 198.18.x.x FakeIPs"
+        );
+        assert_eq!(dns_rules[warp_dns_idx]["server"], "dns-iface-wi-fi");
     }
 }

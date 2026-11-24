@@ -8,11 +8,14 @@ import { useNetFlowStore } from "./store/useNetFlowStore";
 export function App() {
   const initEventListeners = useNetFlowStore((s) => s.initEventListeners);
   const refreshDiscovery = useNetFlowStore((s) => s.refreshDiscovery);
+  const hydrateCanvasDraft = useNetFlowStore((s) => s.hydrateCanvasDraft);
   const loadWorkflows = useNetFlowStore((s) => s.loadWorkflows);
 
   useEffect(() => {
     let active = true;
     let cleanup: (() => void) | undefined;
+
+    hydrateCanvasDraft();
 
     void initEventListeners()
       .then((unlisten) => {
@@ -33,10 +36,19 @@ export function App() {
       active = false;
       cleanup?.();
     };
-  }, [initEventListeners, loadWorkflows, refreshDiscovery]);
+  }, [hydrateCanvasDraft, initEventListeners, loadWorkflows, refreshDiscovery]);
 
   return (
-    <div className="flex h-screen w-screen flex-col overflow-hidden bg-slate-950 text-slate-100">
+    <div
+      className="flex h-screen w-screen flex-col overflow-hidden bg-slate-950 text-slate-100"
+      onContextMenu={(event) => {
+        const target = event.target as HTMLElement | null;
+        if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA")) {
+          return;
+        }
+        event.preventDefault();
+      }}
+    >
       <TopBar />
       <div className="flex min-h-0 flex-1 overflow-hidden">
         <Sidebar />
