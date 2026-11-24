@@ -6,6 +6,7 @@
 
 pub mod compiler;
 pub mod model;
+pub mod storage;
 pub mod validator;
 
 /// Returns the semantic version of `netflow-core`.
