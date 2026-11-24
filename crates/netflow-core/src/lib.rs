@@ -10,6 +10,7 @@ pub mod model;
 pub mod recovery;
 pub mod storage;
 pub mod validator;
+pub mod vpn_adapters;
 pub mod win_net;
 
 /// Returns the semantic version of `netflow-core`.
