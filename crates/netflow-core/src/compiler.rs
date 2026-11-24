@@ -173,6 +173,7 @@ pub fn compile_singbox_config(input: &CompileInput) -> Result<CompiledConfig, Co
         &final_outbound_tag,
     )?;
 
+    let cache_path = input.log_path.with_file_name("cache.db");
     let json = json!({
         "log": log_section,
         "dns": dns_section,
@@ -182,6 +183,11 @@ pub fn compile_singbox_config(input: &CompileInput) -> Result<CompiledConfig, Co
         "experimental": {
             "clash_api": {
                 "external_controller": format!("127.0.0.1:{}", input.clash_api_port)
+            },
+            "cache_file": {
+                "enabled": true,
+                "path": cache_path.to_string_lossy(),
+                "store_fakeip": true
             }
         }
     });
@@ -402,7 +408,7 @@ fn build_dns_section(
             .map(|iface| iface.dns_tag.as_str())
             .unwrap_or(DNS_DEFAULT_TAG);
         rules.push(json!({
-            "process_name": outer_tunnel_processes(chain.provider),
+            "process_path_regex": exes_to_path_regexes(outer_tunnel_processes(chain.provider)),
             "action": "route",
             "server": real_dns_tag
         }));
@@ -520,7 +526,7 @@ fn build_route_section(
             })?;
 
         rules.push(json!({
-            "process_name": outer_tunnel_processes(vpn.chain.provider),
+            "process_path_regex": exes_to_path_regexes(outer_tunnel_processes(vpn.chain.provider)),
             "action": "route",
             "outbound": upstream_tag
         }));
@@ -550,9 +556,12 @@ fn build_route_section(
     }
 
     for (target_tag, exe_set) in grouped_apps {
-        let exes: Vec<String> = exe_set.into_iter().collect();
+        let regexes: Vec<String> = exe_set
+            .into_iter()
+            .map(|exe| exe_to_case_insensitive_path_regex(&exe))
+            .collect();
         rules.push(json!({
-            "process_name": exes,
+            "process_path_regex": regexes,
             "action": "route",
             "outbound": target_tag
         }));
@@ -637,6 +646,29 @@ fn canonicalize_exe_name(raw: &str) -> Result<String, CompileError> {
     })
 }
 
+/// Converts a canonical lowercase executable name (e.g. `karingservice.exe` or `discord.exe`)
+/// into a case-insensitive `sing-box` `process_path_regex` matching any Windows path ending in
+/// that executable filename (`C:\Program Files\Karing\karingService.exe`, etc.).
+fn exe_to_case_insensitive_path_regex(exe: &str) -> String {
+    let mut escaped = String::with_capacity(exe.len() + 8);
+    for ch in exe.chars() {
+        match ch {
+            '.' | '+' | '*' | '?' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    format!(r"(?i)(^|[\\/]){escaped}$")
+}
+
+fn exes_to_path_regexes(exes: &[&str]) -> Vec<String> {
+    exes.iter()
+        .map(|exe| exe_to_case_insensitive_path_regex(exe))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -708,9 +740,10 @@ mod tests {
     }
 
     fn rule_has_process(rule: &serde_json::Value, exe: &str) -> bool {
-        rule.get("process_name")
+        let expected_regex = exe_to_case_insensitive_path_regex(&exe.to_ascii_lowercase());
+        rule.get("process_path_regex")
             .and_then(|v| v.as_array())
-            .is_some_and(|arr| arr.iter().any(|item| item.as_str() == Some(exe)))
+            .is_some_and(|arr| arr.iter().any(|item| item.as_str() == Some(expected_regex.as_str())))
     }
 
     #[test]
@@ -1010,23 +1043,33 @@ mod tests {
         assert_eq!(compiled.json["route"]["final"], "vpn-karing");
 
         let rules = compiled.json["route"]["rules"].as_array().unwrap();
-        let mut observed_exes = Vec::new();
+        let mut observed_regexes = Vec::new();
         for rule in rules {
-            if let Some(arr) = rule.get("process_name").and_then(|v| v.as_array()) {
+            if let Some(arr) = rule.get("process_path_regex").and_then(|v| v.as_array()) {
                 for item in arr {
-                    let s = item.as_str().expect("process_name item is string");
-                    assert_eq!(s, s.to_lowercase(), "process_name '{s}' must be lowercase");
-                    assert!(s.ends_with(".exe"), "process_name '{s}' must end with .exe");
-                    observed_exes.push(s.to_string());
+                    let s = item.as_str().expect("process_path_regex item is string");
+                    assert!(
+                        s.starts_with(r"(?i)(^|[\\/])") && s.ends_with(r"\.exe$"),
+                        "process_path_regex '{s}' must be case-insensitive canonical .exe pattern"
+                    );
+                    observed_regexes.push(s.to_string());
                 }
             }
         }
 
-        assert!(observed_exes.contains(&"chrome.exe".to_string()));
-        assert!(observed_exes.contains(&"idman.exe".to_string()));
-        assert!(observed_exes.contains(&"notepad.exe".to_string()));
-        assert!(observed_exes.contains(&"karingservice.exe".to_string()));
-        assert!(observed_exes.contains(&"karing.exe".to_string()));
+        for expected in [
+            "chrome.exe",
+            "idman.exe",
+            "notepad.exe",
+            "karingservice.exe",
+            "karing.exe",
+        ] {
+            let pattern = exe_to_case_insensitive_path_regex(expected);
+            assert!(
+                observed_regexes.contains(&pattern),
+                "missing pattern {pattern} for {expected}"
+            );
+        }
 
         assert!(matches!(
             canonicalize_exe_name(".exe"),
