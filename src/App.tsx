@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { FlowCanvas } from "./components/FlowCanvas";
+import { LiveTrafficDrawer } from "./components/LiveTrafficDrawer";
 import { Sidebar } from "./components/Sidebar";
 import { TopBar } from "./components/TopBar";
 import { useNetFlowStore } from "./store/useNetFlowStore";
@@ -43,6 +44,7 @@ export function App() {
           <FlowCanvas />
         </main>
       </div>
+      <LiveTrafficDrawer />
     </div>
   );
 }
