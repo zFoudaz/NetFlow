@@ -26,18 +26,20 @@ pub enum StorageError {
     Json(#[from] serde_json::Error),
 }
 
-/// Returns the default per-user directory for NetFlow saved workflows (`%APPDATA%\NetFlow\workflows`).
-pub fn default_workflows_dir() -> PathBuf {
+/// Returns the default per-user NetFlow data directory (`%APPDATA%\NetFlow`).
+pub(crate) fn default_netflow_dir() -> PathBuf {
     if let Some(appdata) = std::env::var_os("APPDATA").filter(|v| !v.is_empty()) {
-        return PathBuf::from(appdata).join("NetFlow").join("workflows");
+        return PathBuf::from(appdata).join("NetFlow");
     }
     if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
-        return PathBuf::from(home)
-            .join(".config")
-            .join("NetFlow")
-            .join("workflows");
+        return PathBuf::from(home).join(".config").join("NetFlow");
     }
-    std::env::temp_dir().join("NetFlow").join("workflows")
+    std::env::temp_dir().join("NetFlow")
+}
+
+/// Returns the default per-user directory for NetFlow saved workflows (`%APPDATA%\NetFlow\workflows`).
+pub fn default_workflows_dir() -> PathBuf {
+    default_netflow_dir().join("workflows")
 }
 
 /// Persistent store for named NetFlow workflows backed by `<id>.json` files.
@@ -226,7 +228,7 @@ fn compare_updated_at_desc(a: &SavedWorkflow, b: &SavedWorkflow) -> std::cmp::Or
     ord.then_with(|| a.id.cmp(&b.id))
 }
 
-fn write_atomic(target: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_atomic(target: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = target.parent().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "target path has no parent")
     })?;

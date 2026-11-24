@@ -6,6 +6,7 @@
 
 pub mod compiler;
 pub mod model;
+pub mod recovery;
 pub mod storage;
 pub mod validator;
 
