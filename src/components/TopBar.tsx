@@ -104,20 +104,18 @@ export function TopBar() {
 
   const handleSelectWorkflow = (id: string, name: string) => {
     const result = selectWorkflow(id);
+    setMenuOpen(false);
     if (result.needsConfirm) {
       setPendingDiscard({ kind: "select", workflowId: id, workflowName: name, applyAfter: false });
-      return;
     }
-    setMenuOpen(false);
   };
 
   const handleSwitchAndApply = async (id: string, name: string) => {
     const result = await switchAndApplyWorkflow(id);
+    setMenuOpen(false);
     if (result.needsConfirm) {
       setPendingDiscard({ kind: "select", workflowId: id, workflowName: name, applyAfter: true });
-      return;
     }
-    setMenuOpen(false);
   };
 
   const handleConfirmDiscard = async () => {
@@ -169,10 +167,8 @@ export function TopBar() {
 
   const handleDeleteCurrent = async () => {
     if (!currentWorkflowId) return;
-    const deleted = await deleteWorkflow(currentWorkflowId);
-    if (deleted) {
-      setMenuOpen(false);
-    }
+    await deleteWorkflow(currentWorkflowId);
+    setMenuOpen(false);
   };
 
   return (

@@ -153,4 +153,47 @@ describe("TopBar", () => {
     await user.click(screen.getByRole("button", { name: /Live Traffic/i }));
     expect(useNetFlowStore.getState().isTrafficDrawerOpen).toBe(true);
   });
+
+  it("closes workflow dropdown when pendingDiscard or blocked-delete banners trigger", async () => {
+    const user = userEvent.setup();
+    useNetFlowStore.setState({
+      workflows: [wfA, wfB],
+      currentWorkflowId: wfA.id,
+      currentWorkflowName: wfA.name,
+      graph: wfA.graph,
+      isDirty: true,
+      engineStatus: activeStatus,
+    });
+
+    render(<TopBar />);
+
+    const switcher = screen.getByRole("button", { name: "Workflow Switcher" });
+
+    // 1. Guarded selectWorkflow closes dropdown when showing pendingDiscard
+    await user.click(switcher);
+    expect(screen.getByRole("menu")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Direct Gaming" }));
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(screen.getByText(/Discard edits and switch to/i)).toBeTruthy();
+
+    await user.click(screen.getByRole("button", { name: "Keep Editing" }));
+
+    // 2. Guarded switchAndApplyWorkflow closes dropdown when showing pendingDiscard
+    await user.click(switcher);
+    expect(screen.getByRole("menu")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: /Switch & Apply/i }));
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(screen.getByText(/Discard edits and switch to/i)).toBeTruthy();
+
+    await user.click(screen.getByRole("button", { name: "Keep Editing" }));
+
+    // 3. Blocked deleteWorkflow on active workflow closes dropdown when showing error banner
+    await user.click(switcher);
+    expect(screen.getByRole("menu")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: /Delete Workflow/i }));
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(
+      screen.getByText(/Cannot delete the active workflow while routing is running/i)
+    ).toBeTruthy();
+  });
 });
