@@ -453,7 +453,16 @@ fn detect_openvpn(
     running_exe_set: &HashSet<String>,
     physical_interfaces: &[PhysicalInterfaceInfo],
 ) -> DetectedVpnInfo {
-    let process_running = has_any_process(running_exe_set, &["openvpn.exe", "ovpnconnector.exe"]);
+    let process_running = has_any_process(
+        running_exe_set,
+        &[
+            "openvpn.exe",
+            "ovpnconnector.exe",
+            "agent_ovpnconnect.exe",
+            "ovpnhelper_service.exe",
+            "openvpnconnect.exe",
+        ],
+    );
     let adapter = find_matching_adapter(adapters, is_openvpn_adapter);
     let adapter_is_up = adapter.is_some_and(|a| a.is_up);
     let is_running = process_running && adapter_is_up;

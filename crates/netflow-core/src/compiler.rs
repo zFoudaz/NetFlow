@@ -585,7 +585,13 @@ fn vpn_outbound_tag(provider: VpnProvider) -> &'static str {
 fn outer_tunnel_processes(provider: VpnProvider) -> &'static [&'static str] {
     match provider {
         VpnProvider::Karing => &["karingservice.exe", "karing.exe"],
-        VpnProvider::OpenVpn => &["openvpn.exe", "ovpnconnector.exe"],
+        VpnProvider::OpenVpn => &[
+            "openvpn.exe",
+            "ovpnconnector.exe",
+            "agent_ovpnconnect.exe",
+            "ovpnhelper_service.exe",
+            "openvpnconnect.exe",
+        ],
     }
 }
 
