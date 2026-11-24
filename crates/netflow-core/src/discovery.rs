@@ -1,5 +1,5 @@
-//! Windows system discovery for physical network adapters, running processes,
-//! and active VPN providers (`Karing`, `Cloudflare WARP`, `OpenVPN`).
+//! Windows system discovery for physical and virtual third-party network adapters,
+//! running processes, and active VPN providers (`Karing`, `OpenVPN`).
 
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
@@ -12,7 +12,6 @@ use crate::recovery::RouteRecord;
 use crate::win_net::{NetOpsError, Win32NetworkOps, WindowsNetworkOps};
 
 const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
-const IF_TYPE_TUNNEL: u32 = 131;
 
 /// Physical network interface discovered on the Windows host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,7 +48,6 @@ pub struct DetectedVpnInfo {
     pub adapter_is_up: bool,
     pub adapter_gateway: Option<String>,
     pub remote_server_ip: Option<String>,
-    pub warp_current_mode: Option<String>,
 }
 
 /// Complete read-only snapshot of Windows interfaces, VPN providers, and running processes.
@@ -113,13 +111,6 @@ impl SystemDiscovery for Win32Discovery {
             .collect();
 
         let karing = detect_karing(&raw_adapters, &ipv4_routes, &running_exe_set, &ports_by_exe);
-        let warp = detect_warp(
-            &net_ops,
-            &raw_adapters,
-            &ipv4_routes,
-            &running_exe_set,
-            &ports_by_exe,
-        );
         let openvpn = detect_openvpn(
             &raw_adapters,
             &ipv4_routes,
@@ -129,7 +120,7 @@ impl SystemDiscovery for Win32Discovery {
 
         Ok(DiscoverySnapshot {
             interfaces,
-            vpns: vec![karing, warp, openvpn],
+            vpns: vec![karing, openvpn],
             processes,
         })
     }
@@ -160,10 +151,6 @@ fn is_karing_adapter(alias: &str, description: &str) -> bool {
     contains_any_ci(alias, description, &["karing"])
 }
 
-fn is_warp_adapter(alias: &str, description: &str) -> bool {
-    contains_any_ci(alias, description, &["cloudflarewarp", "cloudflare warp"])
-}
-
 fn is_openvpn_adapter(alias: &str, description: &str) -> bool {
     contains_any_ci(alias, description, &["openvpn", "tap-windows"])
 }
@@ -173,7 +160,7 @@ pub(crate) fn is_virtual_or_excluded_adapter(
     description: &str,
     if_type: u32,
 ) -> bool {
-    if if_type == IF_TYPE_SOFTWARE_LOOPBACK || if_type == IF_TYPE_TUNNEL {
+    if if_type == IF_TYPE_SOFTWARE_LOOPBACK {
         return true;
     }
 
@@ -184,14 +171,10 @@ pub(crate) fn is_virtual_or_excluded_adapter(
             "loopback",
             "netflow-tun",
             "karing",
-            "cloudflarewarp",
-            "cloudflare warp",
             "openvpn",
             "tap-windows",
             "vethernet",
             "hyper-v virtual",
-            "wintun",
-            "wireguard",
             "teredo",
             "6to4",
             "isatap",
@@ -321,14 +304,6 @@ pub(crate) fn pick_karing_mixed_port(ports: &[u16]) -> Option<u16> {
         .iter()
         .copied()
         .find(|&p| p != 0 && !CONTROL_PORTS.contains(&p))
-}
-
-fn pick_port_preferring(ports: &[u16], preferred: u16) -> Option<u16> {
-    if ports.contains(&preferred) {
-        Some(preferred)
-    } else {
-        ports.iter().copied().find(|&p| p != 0)
-    }
 }
 
 /// Extracts OpenVPN's remote server IPv4 from a `/32` host route routed via a physical gateway.
@@ -469,47 +444,6 @@ fn detect_karing(
         adapter_is_up,
         adapter_gateway: resolve_adapter_gateway(adapter, ipv4_routes),
         remote_server_ip: None,
-        warp_current_mode: None,
-    }
-}
-
-fn detect_warp(
-    net_ops: &dyn WindowsNetworkOps,
-    adapters: &[RawAdapterInfo],
-    ipv4_routes: &[RouteRecord],
-    running_exe_set: &HashSet<String>,
-    ports_by_exe: &HashMap<String, Vec<u16>>,
-) -> DetectedVpnInfo {
-    let process_running = has_any_process(running_exe_set, &["warp-svc.exe"]);
-    let adapter = find_matching_adapter(adapters, is_warp_adapter);
-    let adapter_is_up = adapter.is_some_and(|a| a.is_up);
-    let warp_current_mode = if process_running || adapter.is_some() {
-        net_ops.warp_cli_get_mode().ok().flatten()
-    } else {
-        None
-    };
-
-    let detected_port = if warp_current_mode.as_deref() == Some("proxy") {
-        ports_by_exe
-            .get("warp-svc.exe")
-            .and_then(|ports| pick_port_preferring(ports, 40000))
-    } else {
-        None
-    };
-    let is_running = process_running
-        && (adapter_is_up
-            || (warp_current_mode.as_deref() == Some("proxy") && detected_port.is_some()));
-
-    DetectedVpnInfo {
-        provider: VpnProvider::CloudflareWarp,
-        is_running,
-        detected_port,
-        adapter_alias: adapter.map(|a| a.alias.clone()),
-        adapter_if_index: adapter.map(|a| a.if_index),
-        adapter_is_up,
-        adapter_gateway: resolve_adapter_gateway(adapter, ipv4_routes),
-        remote_server_ip: None,
-        warp_current_mode,
     }
 }
 
@@ -542,7 +476,6 @@ fn detect_openvpn(
         adapter_is_up,
         adapter_gateway: resolve_adapter_gateway(adapter, ipv4_routes),
         remote_server_ip,
-        warp_current_mode: None,
     }
 }
 
@@ -815,7 +748,7 @@ mod platform {
 mod tests {
     use super::*;
     use crate::model::VpnProvider;
-    use crate::recovery::{InterfaceMetricSnapshot, RouteRecord, SystemProxySnapshot};
+    use crate::recovery::RouteRecord;
 
     struct AdapterSpec<'a> {
         alias: &'a str,
@@ -888,7 +821,7 @@ mod tests {
                 alias: "CloudflareWARP",
                 description: "Cloudflare WARP WireGuard Tunnel",
                 if_index: 44,
-                if_type: 53,
+                if_type: 131,
                 is_up: true,
                 ipv4: Some("172.16.0.2"),
                 gateway_ipv4: None,
@@ -897,8 +830,20 @@ mod tests {
             }
             .build(),
             AdapterSpec {
-                alias: "OpenVPN Data Channel Offload",
-                description: "OpenVPN Data Channel Offload",
+                alias: "WireGuard Tunnel",
+                description: "WireGuard Tunnel Wintun",
+                if_index: 45,
+                if_type: 131,
+                is_up: true,
+                ipv4: Some("10.66.66.2"),
+                gateway_ipv4: None,
+                link_speed_bps: 100_000_000_000,
+                ipv4_metric: 10,
+            }
+            .build(),
+            AdapterSpec {
+                alias: "OpenVPN Wintun",
+                description: "OpenVPN Wintun",
                 if_index: 22,
                 if_type: 53,
                 is_up: true,
@@ -968,7 +913,10 @@ mod tests {
 
         let physical = classify_physical_interfaces(&adapters, &routes);
         let aliases: Vec<&str> = physical.iter().map(|i| i.alias.as_str()).collect();
-        assert_eq!(aliases, vec!["Wi-Fi", "Ethernet"]);
+        assert_eq!(
+            aliases,
+            vec!["Wi-Fi", "CloudflareWARP", "WireGuard Tunnel", "Ethernet"]
+        );
 
         let wifi = &physical[0];
         assert_eq!(wifi.if_index, 8);
@@ -978,7 +926,15 @@ mod tests {
         assert_eq!(wifi.ipv4.as_deref(), Some("192.168.1.50"));
         assert_eq!(wifi.gateway_ipv4.as_deref(), Some("192.168.1.1"));
 
-        let eth = &physical[1];
+        let warp = &physical[1];
+        assert_eq!(warp.if_index, 44);
+        assert!(warp.is_up);
+
+        let wg = &physical[2];
+        assert_eq!(wg.if_index, 45);
+        assert!(wg.is_up);
+
+        let eth = &physical[3];
         assert_eq!(eth.if_index, 10);
         assert!(!eth.is_up);
         assert_eq!(eth.link_speed_mbps, 0);
@@ -1073,47 +1029,6 @@ mod tests {
         );
     }
 
-    struct StubWarpOps(Option<String>);
-
-    impl WindowsNetworkOps for StubWarpOps {
-        fn list_routes(&self, _: Option<u32>, _: bool) -> Result<Vec<RouteRecord>, NetOpsError> {
-            Ok(Vec::new())
-        }
-        fn add_route(&self, _: &RouteRecord) -> Result<(), NetOpsError> {
-            Ok(())
-        }
-        fn remove_route(&self, _: &RouteRecord) -> Result<(), NetOpsError> {
-            Ok(())
-        }
-        fn get_interface_metric(&self, _: u32, _: bool) -> Result<InterfaceMetricSnapshot, NetOpsError> {
-            Err(NetOpsError::UnsupportedPlatform)
-        }
-        fn set_interface_metric(&self, _: u32, _: bool, _: u32, _: bool) -> Result<(), NetOpsError> {
-            Ok(())
-        }
-        fn find_best_route_interface(&self, _: &str) -> Result<Option<String>, NetOpsError> {
-            Ok(None)
-        }
-        fn find_interface_index_by_alias(&self, _: &str) -> Result<Option<u32>, NetOpsError> {
-            Ok(None)
-        }
-        fn get_system_proxy(&self) -> Result<SystemProxySnapshot, NetOpsError> {
-            Err(NetOpsError::UnsupportedPlatform)
-        }
-        fn set_system_proxy(&self, _: &SystemProxySnapshot) -> Result<(), NetOpsError> {
-            Ok(())
-        }
-        fn disable_system_proxy(&self) -> Result<(), NetOpsError> {
-            Ok(())
-        }
-        fn warp_cli_get_mode(&self) -> Result<Option<String>, NetOpsError> {
-            Ok(self.0.clone())
-        }
-        fn warp_cli_set_mode(&self, _: &str) -> Result<(), NetOpsError> {
-            Ok(())
-        }
-    }
-
     #[test]
     fn test_detects_vpn_providers_and_route_fallback_gateways() {
         let adapters = vec![
@@ -1130,20 +1045,8 @@ mod tests {
             }
             .build(),
             AdapterSpec {
-                alias: "CloudflareWARP",
-                description: "Cloudflare WARP WireGuard Tunnel",
-                if_index: 44,
-                if_type: 53,
-                is_up: true,
-                ipv4: Some("172.16.0.2"),
-                gateway_ipv4: None,
-                link_speed_bps: 100_000_000_000,
-                ipv4_metric: 5,
-            }
-            .build(),
-            AdapterSpec {
-                alias: "OpenVPN Data Channel Offload",
-                description: "OpenVPN Data Channel Offload",
+                alias: "OpenVPN Wintun",
+                description: "OpenVPN Wintun",
                 if_index: 22,
                 if_type: 53,
                 is_up: true,
@@ -1161,13 +1064,6 @@ mod tests {
                 destination_prefix: "128.0.0.0/1".to_string(),
                 next_hop: "10.20.0.2".to_string(),
                 route_metric: 0,
-                is_ipv6: false,
-            },
-            RouteRecord {
-                interface_index: 44,
-                destination_prefix: "0.0.0.0/0".to_string(),
-                next_hop: "172.16.0.1".to_string(),
-                route_metric: 5,
                 is_ipv6: false,
             },
             RouteRecord {
@@ -1190,13 +1086,12 @@ mod tests {
             is_default_gateway: true,
         }];
 
-        let running: HashSet<String> = ["karingservice.exe", "warp-svc.exe", "ovpnconnector.exe"]
+        let running: HashSet<String> = ["karingservice.exe", "ovpnconnector.exe"]
             .into_iter()
             .map(str::to_string)
             .collect();
         let mut ports = HashMap::new();
         ports.insert("karingservice.exe".to_string(), vec![5848, 3067, 3066]);
-        ports.insert("warp-svc.exe".to_string(), vec![40000]);
 
         let karing = detect_karing(&adapters, &routes, &running, &ports);
         assert!(karing.is_running);
@@ -1204,13 +1099,6 @@ mod tests {
         assert_eq!(karing.detected_port, Some(3067));
         assert_eq!(karing.adapter_if_index, Some(41));
         assert_eq!(karing.adapter_gateway.as_deref(), Some("10.20.0.2"));
-
-        let warp = detect_warp(&StubWarpOps(Some("proxy".to_string())), &adapters, &routes, &running, &ports);
-        assert!(warp.is_running);
-        assert!(warp.adapter_is_up);
-        assert_eq!(warp.warp_current_mode.as_deref(), Some("proxy"));
-        assert_eq!(warp.detected_port, Some(40000));
-        assert_eq!(warp.adapter_gateway.as_deref(), Some("172.16.0.1"));
 
         let openvpn = detect_openvpn(&adapters, &routes, &running, &physical);
         assert!(openvpn.is_running);
@@ -1223,18 +1111,6 @@ mod tests {
     #[test]
     fn test_always_on_services_without_live_tunnel_are_reported_disconnected() {
         let down_adapters = vec![
-            AdapterSpec {
-                alias: "CloudflareWARP",
-                description: "Cloudflare WARP WireGuard Tunnel",
-                if_index: 44,
-                if_type: 53,
-                is_up: false,
-                ipv4: None,
-                gateway_ipv4: None,
-                link_speed_bps: 0,
-                ipv4_metric: 5,
-            }
-            .build(),
             AdapterSpec {
                 alias: "OpenVPN Data Channel Offload",
                 description: "OpenVPN Data Channel Offload",
@@ -1261,11 +1137,10 @@ mod tests {
             .build(),
         ];
 
-        let running: HashSet<String> = ["karingservice.exe", "warp-svc.exe", "ovpnconnector.exe"]
+        let running: HashSet<String> = ["karingservice.exe", "ovpnconnector.exe"]
             .into_iter()
             .map(str::to_string)
             .collect();
-        let empty_ports = HashMap::new();
 
         // Karing service running with only control ports (no SOCKS/Mixed port) -> not running
         let mut control_only_ports = HashMap::new();
@@ -1274,29 +1149,6 @@ mod tests {
         assert!(!karing.is_running);
         assert_eq!(karing.detected_port, None);
 
-        // WARP in "proxy" mode with no listening socket does NOT fabricate 40000 and is not running
-        let warp_proxy_disconnected = detect_warp(
-            &StubWarpOps(Some("proxy".to_string())),
-            &down_adapters,
-            &[],
-            &running,
-            &empty_ports,
-        );
-        assert!(!warp_proxy_disconnected.is_running);
-        assert_eq!(warp_proxy_disconnected.detected_port, None);
-        assert!(!warp_proxy_disconnected.adapter_is_up);
-
-        // WARP in "warp" TUN mode with adapter down -> not running
-        let warp_tun_disconnected = detect_warp(
-            &StubWarpOps(Some("warp".to_string())),
-            &down_adapters,
-            &[],
-            &running,
-            &empty_ports,
-        );
-        assert!(!warp_tun_disconnected.is_running);
-        assert!(!warp_tun_disconnected.adapter_is_up);
-
         // OpenVPN prefers the is_up == true adapter over the down DCO adapter
         let openvpn_up = detect_openvpn(&down_adapters, &[], &running, &[]);
         assert!(openvpn_up.is_running);
@@ -1304,7 +1156,7 @@ mod tests {
         assert_eq!(openvpn_up.adapter_if_index, Some(25));
 
         // OpenVPN with only down adapter -> not running even when ovpnconnector.exe is running
-        let down_only_ovpn = vec![down_adapters[1].clone()];
+        let down_only_ovpn = vec![down_adapters[0].clone()];
         let openvpn_down = detect_openvpn(&down_only_ovpn, &[], &running, &[]);
         assert!(!openvpn_down.is_running);
         assert!(!openvpn_down.adapter_is_up);
@@ -1324,12 +1176,8 @@ mod tests {
             !snapshot.processes.is_empty(),
             "expected non-empty running process list on Windows"
         );
-        assert_eq!(snapshot.vpns.len(), 3);
+        assert_eq!(snapshot.vpns.len(), 2);
         assert!(snapshot.vpns.iter().any(|v| v.provider == VpnProvider::Karing));
-        assert!(snapshot
-            .vpns
-            .iter()
-            .any(|v| v.provider == VpnProvider::CloudflareWarp));
         assert!(snapshot.vpns.iter().any(|v| v.provider == VpnProvider::OpenVpn));
 
         for iface in &snapshot.interfaces {
@@ -1337,7 +1185,7 @@ mod tests {
             assert!(!lower.contains("loopback"));
             assert!(!lower.contains("netflow-tun"));
             assert!(!lower.contains("karing"));
-            assert!(!lower.contains("cloudflarewarp"));
+            assert!(!lower.contains("openvpn"));
             assert!(!lower.contains("vethernet"));
         }
 

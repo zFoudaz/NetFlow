@@ -47,7 +47,6 @@ const makeGraph = (overrides?: Partial<WorkflowGraph>): WorkflowGraph => ({
         isDefault: false,
         settings: {
           karingPortOverride: null,
-          warpMode: "tun",
           openvpnAdapterOverride: null,
           openvpnServerIpOverride: null,
         },

@@ -21,18 +21,18 @@ const sampleGraph: WorkflowGraph = {
         type: "vpn",
         provider: "karing",
         isDefault: false,
-        settings: { warpMode: "tun" },
+        settings: {},
       },
     },
     {
-      id: "vpn-warp",
+      id: "vpn-ovpn",
       x: 340,
       y: 220,
       kind: {
         type: "vpn",
-        provider: "cloudflareWarp",
+        provider: "openVpn",
         isDefault: false,
-        settings: { warpMode: "tun" },
+        settings: {},
       },
     },
   ],
@@ -172,35 +172,19 @@ describe("LiveTrafficDrawer", () => {
     expect(defaultBadge.className).toMatch(/slate/);
   });
 
-  it("shows no-match state, clears filter, and resolves WARP/OpenVPN labels with GB formatting", async () => {
+  it("shows no-match state, clears filter, and resolves Karing/OpenVPN labels with GB formatting", async () => {
     const user = userEvent.setup();
     useNetFlowStore.setState({
       isTrafficDrawerOpen: true,
-      graph: {
-        ...sampleGraph,
-        nodes: [
-          ...sampleGraph.nodes,
-          {
-            id: "vpn-ovpn",
-            x: 340,
-            y: 320,
-            kind: {
-              type: "vpn",
-              provider: "openVpn",
-              isDefault: false,
-              settings: { warpMode: "tun" },
-            },
-          },
-        ],
-      },
+      graph: sampleGraph,
       liveConnections: [
         {
-          id: "conn-warp",
+          id: "conn-karing",
           processName: "firefox.exe",
           destination: "1.1.1.1:443",
           network: "udp",
-          outboundTag: "vpn-warp",
-          nodeId: "vpn-warp",
+          outboundTag: "vpn-karing",
+          nodeId: "vpn-karing",
           uploadBytes: 1024 * 1024 * 1024 * 2,
           downloadBytes: 500,
         },
@@ -219,7 +203,7 @@ describe("LiveTrafficDrawer", () => {
 
     render(<LiveTrafficDrawer />);
 
-    expect(screen.getByText("Cloudflare WARP")).toBeTruthy();
+    expect(screen.getByText("Karing")).toBeTruthy();
     expect(screen.getByText("OpenVPN")).toBeTruthy();
     expect(screen.getByText(/2\.0 GB/)).toBeTruthy();
     expect(screen.getByText(/500 B/)).toBeTruthy();

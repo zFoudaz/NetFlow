@@ -269,7 +269,7 @@ pub(crate) fn write_atomic(target: &Path, bytes: &[u8]) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::model::{
-        NodeKind, VpnNodeSettings, VpnProvider, WarpMode, WorkflowEdge, WorkflowGraph, WorkflowNode,
+        NodeKind, VpnNodeSettings, VpnProvider, WorkflowEdge, WorkflowGraph, WorkflowNode,
     };
 
     struct TempDirGuard(PathBuf);
@@ -313,11 +313,10 @@ mod tests {
                     x: 350.0,
                     y: 200.0,
                     kind: NodeKind::Vpn {
-                        provider: VpnProvider::CloudflareWarp,
+                        provider: VpnProvider::Karing,
                         is_default: true,
                         settings: VpnNodeSettings {
                             karing_port_override: Some(3067),
-                            warp_mode: WarpMode::Proxy,
                             openvpn_adapter_override: None,
                             openvpn_server_ip_override: None,
                         },

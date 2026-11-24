@@ -11,20 +11,17 @@ export const NETFLOW_DND_MIME = "application/netflow-node";
 
 export const VPN_PROVIDERS: readonly VpnProvider[] = [
   "karing",
-  "cloudflareWarp",
   "openVpn",
 ] as const;
 
 export const VPN_PROVIDER_LABELS: Record<VpnProvider, string> = {
   karing: "Karing",
-  cloudflareWarp: "Cloudflare WARP",
   openVpn: "OpenVPN",
 };
 
 export function createDefaultVpnSettings(): VpnNodeSettings {
   return {
     karingPortOverride: null,
-    warpMode: "tun",
     openvpnAdapterOverride: null,
     openvpnServerIpOverride: null,
   };
@@ -48,9 +45,7 @@ export function parseDragNodePayload(raw: string): DragNodePayload | null {
     }
     if (
       record.type === "vpn" &&
-      (record.provider === "karing" ||
-        record.provider === "cloudflareWarp" ||
-        record.provider === "openVpn")
+      (record.provider === "karing" || record.provider === "openVpn")
     ) {
       return { type: "vpn", provider: record.provider };
     }

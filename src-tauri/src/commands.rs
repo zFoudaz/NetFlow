@@ -464,7 +464,6 @@ mod tests {
                         adapter_is_up: false,
                         adapter_gateway: None,
                         remote_server_ip: None,
-                        warp_current_mode: None,
                     }],
                     processes: vec![RunningProcessInfo {
                         exe_name: "chrome.exe".to_string(),
@@ -574,14 +573,6 @@ mod tests {
         fn disable_system_proxy(&self) -> Result<(), NetOpsError> {
             let mut guard = self.system_proxy.lock().unwrap();
             guard.proxy_enable = 0;
-            Ok(())
-        }
-
-        fn warp_cli_get_mode(&self) -> Result<Option<String>, NetOpsError> {
-            Ok(None)
-        }
-
-        fn warp_cli_set_mode(&self, _mode: &str) -> Result<(), NetOpsError> {
             Ok(())
         }
     }

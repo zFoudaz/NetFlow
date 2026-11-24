@@ -15,11 +15,6 @@ function getVpnHint(provider: VpnProvider, info?: DetectedVpnInfo): string {
   if (provider === "karing") {
     return info?.detectedPort ? `Port ${info.detectedPort}` : "Port 3067 (auto)";
   }
-  if (provider === "cloudflareWarp") {
-    return info?.warpCurrentMode
-      ? `Mode: ${info.warpCurrentMode.toUpperCase()}`
-      : "TUN / Proxy";
-  }
   return info?.adapterAlias ? `Adapter: ${info.adapterAlias}` : "TAP / Wintun";
 }
 

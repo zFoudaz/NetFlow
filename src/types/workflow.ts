@@ -1,10 +1,7 @@
-export type VpnProvider = "karing" | "cloudflareWarp" | "openVpn";
-
-export type WarpMode = "tun" | "proxy";
+export type VpnProvider = "karing" | "openVpn";
 
 export interface VpnNodeSettings {
   karingPortOverride?: number | null;
-  warpMode: WarpMode;
   openvpnAdapterOverride?: string | null;
   openvpnServerIpOverride?: string | null;
 }
@@ -89,7 +86,6 @@ export interface DetectedVpnInfo {
   adapterIsUp: boolean;
   adapterGateway: string | null;
   remoteServerIp: string | null;
-  warpCurrentMode: string | null;
 }
 
 export interface RunningProcessInfo {

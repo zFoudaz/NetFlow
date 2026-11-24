@@ -7,17 +7,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "camelCase")]
 pub enum VpnProvider {
     Karing,
-    CloudflareWarp,
     OpenVpn,
-}
-
-/// Tunneling mode for Cloudflare WARP nodes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub enum WarpMode {
-    #[default]
-    Tun,
-    Proxy,
 }
 
 /// Provider-specific overrides configured on a VPN node.
@@ -25,7 +15,6 @@ pub enum WarpMode {
 #[serde(rename_all = "camelCase", default)]
 pub struct VpnNodeSettings {
     pub karing_port_override: Option<u16>,
-    pub warp_mode: WarpMode,
     pub openvpn_adapter_override: Option<String>,
     pub openvpn_server_ip_override: Option<String>,
 }
@@ -97,7 +86,6 @@ pub enum ValidationErrorCode {
     MissingUpstreamInterface,
     DuplicateVpnProvider,
     MultipleUpstreams,
-    WarpProxyCannotChainDownstream,
     MultipleDefaults,
     DuplicateAppAssignment,
     InvalidAppName,

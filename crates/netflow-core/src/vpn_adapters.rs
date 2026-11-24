@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::compiler::ResolvedVpnRuntimeInfo;
 use crate::discovery::{DetectedVpnInfo, PhysicalInterfaceInfo};
-use crate::model::{VpnNodeSettings, VpnProvider, WarpMode};
+use crate::model::{VpnNodeSettings, VpnProvider};
 use crate::recovery::{RouteRecord, VpnRecoveryEntry};
 use crate::win_net::{
     is_benign_remove_route_error, is_benign_restore_add_route_error,
@@ -15,7 +15,6 @@ use crate::win_net::{
 };
 
 const NEUTRALIZED_METRIC: u32 = 500;
-const DEFAULT_WARP_PROXY_PORT: u16 = 40000;
 
 /// Typed errors returned by VPN adapter pre-flight, neutralization, pinning, and restoration.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -29,8 +28,6 @@ pub enum VpnAdapterError {
     },
     #[error("missing SOCKS5 port for Karing; enable Karing or configure a port override")]
     MissingKaringPort,
-    #[error("missing TUN adapter alias for Cloudflare WARP")]
-    MissingWarpAdapterAlias,
     #[error("missing network interface index for {provider:?}")]
     MissingAdapterIfIndex { provider: VpnProvider },
     #[error("missing virtual adapter alias for OpenVPN")]
@@ -74,56 +71,10 @@ pub fn preflight_and_resolve_vpn(
             Ok(ResolvedVpnRuntimeInfo {
                 provider: VpnProvider::Karing,
                 karing_socks_port: Some(port),
-                warp_mode: WarpMode::Tun,
-                warp_socks_port: None,
-                warp_adapter_alias: None,
                 openvpn_adapter_alias: None,
                 openvpn_server_ip: None,
             })
         }
-        VpnProvider::CloudflareWarp => match settings.warp_mode {
-            WarpMode::Tun => {
-                if !detected.adapter_is_up {
-                    return Err(VpnAdapterError::NotRunning(VpnProvider::CloudflareWarp));
-                }
-                let alias = non_empty_trimmed(detected.adapter_alias.as_deref())
-                    .or_else(|| detected.adapter_if_index.map(|_| "CloudflareWARP".to_string()))
-                    .ok_or(VpnAdapterError::MissingWarpAdapterAlias)?;
-                Ok(ResolvedVpnRuntimeInfo {
-                    provider: VpnProvider::CloudflareWarp,
-                    karing_socks_port: None,
-                    warp_mode: WarpMode::Tun,
-                    warp_socks_port: None,
-                    warp_adapter_alias: Some(alias),
-                    openvpn_adapter_alias: None,
-                    openvpn_server_ip: None,
-                })
-            }
-            WarpMode::Proxy => {
-                let proxy_ready = detected.detected_port.is_some()
-                    || detected.adapter_is_up
-                    || detected
-                        .warp_current_mode
-                        .as_deref()
-                        .is_some_and(|m| m.eq_ignore_ascii_case("proxy"));
-                if !proxy_ready {
-                    return Err(VpnAdapterError::NotRunning(VpnProvider::CloudflareWarp));
-                }
-                let port = detected
-                    .detected_port
-                    .filter(|&p| p != 0)
-                    .unwrap_or(DEFAULT_WARP_PROXY_PORT);
-                Ok(ResolvedVpnRuntimeInfo {
-                    provider: VpnProvider::CloudflareWarp,
-                    karing_socks_port: None,
-                    warp_mode: WarpMode::Proxy,
-                    warp_socks_port: Some(port),
-                    warp_adapter_alias: non_empty_trimmed(detected.adapter_alias.as_deref()),
-                    openvpn_adapter_alias: None,
-                    openvpn_server_ip: None,
-                })
-            }
-        },
         VpnProvider::OpenVpn => {
             if !detected.adapter_is_up {
                 return Err(VpnAdapterError::NotRunning(VpnProvider::OpenVpn));
@@ -138,9 +89,6 @@ pub fn preflight_and_resolve_vpn(
             Ok(ResolvedVpnRuntimeInfo {
                 provider: VpnProvider::OpenVpn,
                 karing_socks_port: None,
-                warp_mode: WarpMode::Tun,
-                warp_socks_port: None,
-                warp_adapter_alias: None,
                 openvpn_adapter_alias: Some(alias),
                 openvpn_server_ip: server_ip,
             })
@@ -181,24 +129,6 @@ pub fn neutralize_vpn(
                 should_neutralize_split_or_default_route,
             )
         }
-        VpnProvider::CloudflareWarp => match resolved.warp_mode {
-            WarpMode::Tun => {
-                let if_index = resolve_adapter_if_index(
-                    ops,
-                    VpnProvider::CloudflareWarp,
-                    detected.adapter_if_index,
-                    resolved.warp_adapter_alias.as_deref(),
-                )?;
-                neutralize_tun_adapter(
-                    ops,
-                    VpnProvider::CloudflareWarp,
-                    if_index,
-                    detected.adapter_gateway.as_deref(),
-                    should_neutralize_split_or_default_route,
-                )
-            }
-            WarpMode::Proxy => neutralize_warp_proxy(ops, detected),
-        },
         VpnProvider::OpenVpn => {
             let if_index = resolve_adapter_if_index(
                 ops,
@@ -217,10 +147,10 @@ pub fn neutralize_vpn(
     }
 }
 
-/// Restores a VPN provider's routes, interface metrics, and WARP mode from a recovery entry.
+/// Restores a VPN provider's routes and interface metrics from a recovery entry.
 ///
 /// Continues attempting all remaining restoration steps even if an individual step fails,
-/// so partial failures do not skip restoring routes, metrics, or WARP mode.
+/// so partial failures do not skip restoring routes or metrics.
 pub fn restore_vpn(
     ops: &dyn WindowsNetworkOps,
     entry: &VpnRecoveryEntry,
@@ -248,12 +178,6 @@ pub fn restore_vpn(
             if !is_benign_restore_add_route_error(ops, route.interface_index, &err) {
                 errors.push(err);
             }
-        }
-    }
-
-    if let Some(prev_mode) = &entry.warp_previous_mode {
-        if let Err(err) = ops.warp_cli_set_mode(prev_mode) {
-            errors.push(err);
         }
     }
 
@@ -316,7 +240,6 @@ fn empty_recovery_entry(provider: VpnProvider) -> VpnRecoveryEntry {
         removed_routes: Vec::new(),
         added_routes: Vec::new(),
         metric_snapshots: Vec::new(),
-        warp_previous_mode: None,
     }
 }
 
@@ -365,31 +288,6 @@ fn resolve_adapter_if_index(
         }
     }
     Err(VpnAdapterError::MissingAdapterIfIndex { provider })
-}
-
-fn neutralize_warp_proxy(
-    ops: &dyn WindowsNetworkOps,
-    detected: &DetectedVpnInfo,
-) -> Result<VpnRecoveryEntry, VpnAdapterError> {
-    let current_mode = ops
-        .warp_cli_get_mode()?
-        .or_else(|| non_empty_trimmed(detected.warp_current_mode.as_deref()));
-
-    let warp_previous_mode = match current_mode {
-        Some(ref mode) if mode.eq_ignore_ascii_case("proxy") => None,
-        other => {
-            ops.warp_cli_set_mode("proxy")?;
-            other
-        }
-    };
-
-    Ok(VpnRecoveryEntry {
-        provider: VpnProvider::CloudflareWarp,
-        removed_routes: Vec::new(),
-        added_routes: Vec::new(),
-        metric_snapshots: Vec::new(),
-        warp_previous_mode,
-    })
 }
 
 fn neutralize_tun_adapter(
@@ -582,8 +480,6 @@ mod tests {
         routes: Vec<RouteRecord>,
         metrics: HashMap<(u32, bool), InterfaceMetricSnapshot>,
         alias_to_if_index: HashMap<String, u32>,
-        warp_mode: Option<String>,
-        warp_set_calls: Vec<String>,
         fail_remove_prefix: Option<String>,
         vanished_interfaces: HashSet<u32>,
         vanished_error_code: Option<u32>,
@@ -626,10 +522,6 @@ mod tests {
                 .insert(alias.to_ascii_lowercase(), if_index);
         }
 
-        fn set_warp_mode(&self, mode: Option<&str>) {
-            self.state.lock().unwrap().warp_mode = mode.map(ToString::to_string);
-        }
-
         fn set_fail_remove_prefix(&self, prefix: Option<&str>) {
             self.state.lock().unwrap().fail_remove_prefix = prefix.map(ToString::to_string);
         }
@@ -670,10 +562,6 @@ mod tests {
                 .get(&(if_index, is_ipv6))
                 .cloned()
                 .expect("metric exists")
-        }
-
-        fn warp_set_calls(&self) -> Vec<String> {
-            self.state.lock().unwrap().warp_set_calls.clone()
         }
     }
 
@@ -835,17 +723,6 @@ mod tests {
         fn disable_system_proxy(&self) -> Result<(), NetOpsError> {
             Ok(())
         }
-
-        fn warp_cli_get_mode(&self) -> Result<Option<String>, NetOpsError> {
-            Ok(self.state.lock().unwrap().warp_mode.clone())
-        }
-
-        fn warp_cli_set_mode(&self, mode: &str) -> Result<(), NetOpsError> {
-            let mut guard = self.state.lock().unwrap();
-            guard.warp_set_calls.push(mode.to_string());
-            guard.warp_mode = Some(mode.to_string());
-            Ok(())
-        }
     }
 
     fn route(if_index: u32, prefix: &str, next_hop: &str, metric: u32, is_ipv6: bool) -> RouteRecord {
@@ -907,7 +784,6 @@ mod tests {
             adapter_is_up: true,
             adapter_gateway: Some("10.20.0.2".to_string()),
             remote_server_ip: None,
-            warp_current_mode: None,
         };
         let settings = VpnNodeSettings::default();
         let resolved = preflight_and_resolve_vpn(VpnProvider::Karing, &settings, &detected)
@@ -959,118 +835,6 @@ mod tests {
     }
 
     #[test]
-    fn test_warp_tun_primary_neutralizes_routes_and_proxy_fallback_switches_via_warp_cli() {
-        // Part A: WARP TUN primary
-        let warp_if = 33;
-        let tun_routes = vec![
-            route(warp_if, "0.0.0.0/0", "0.0.0.0", 5, false),
-            route(warp_if, "::/0", "::", 5, true),
-            route(warp_if, "172.16.0.2/32", "0.0.0.0", 256, false),
-            route(warp_if, "224.0.0.0/4", "0.0.0.0", 256, false),
-        ];
-        let ops_tun = MockNetworkOps::with_routes(tun_routes.clone());
-        ops_tun.set_metric(warp_if, false, 15, false);
-        ops_tun.set_metric(warp_if, true, 15, false);
-
-        let detected_tun = DetectedVpnInfo {
-            provider: VpnProvider::CloudflareWarp,
-            is_running: true,
-            detected_port: None,
-            adapter_alias: Some("CloudflareWARP".to_string()),
-            adapter_if_index: Some(warp_if),
-            adapter_is_up: true,
-            adapter_gateway: None,
-            remote_server_ip: None,
-            warp_current_mode: Some("warp".to_string()),
-        };
-        let settings_tun = VpnNodeSettings {
-            warp_mode: WarpMode::Tun,
-            ..Default::default()
-        };
-        let resolved_tun =
-            preflight_and_resolve_vpn(VpnProvider::CloudflareWarp, &settings_tun, &detected_tun)
-                .expect("preflight warp tun");
-        assert_eq!(resolved_tun.warp_mode, WarpMode::Tun);
-        assert_eq!(
-            resolved_tun.warp_adapter_alias.as_deref(),
-            Some("CloudflareWARP")
-        );
-
-        let entry_tun =
-            neutralize_vpn(&ops_tun, VpnProvider::CloudflareWarp, &resolved_tun, &detected_tun)
-                .expect("neutralize warp tun");
-        assert_eq!(entry_tun.removed_routes.len(), 2);
-        assert_eq!(
-            entry_tun.added_routes,
-            vec![route(warp_if, "0.0.0.0/0", "0.0.0.0", 500, false)]
-        );
-        assert_eq!(ops_tun.metric_for(warp_if, false).original_metric, 500);
-        assert_eq!(ops_tun.metric_for(warp_if, true).original_metric, 500);
-
-        restore_vpn(&ops_tun, &entry_tun).expect("restore warp tun");
-        assert_eq!(ops_tun.metric_for(warp_if, false).original_metric, 15);
-        assert_eq!(ops_tun.all_routes().len(), tun_routes.len());
-
-        // Part B: WARP Proxy fallback switches via warp-cli and records previous mode
-        let ops_proxy = MockNetworkOps::new();
-        ops_proxy.set_warp_mode(Some("warp+doh"));
-
-        let detected_proxy = DetectedVpnInfo {
-            provider: VpnProvider::CloudflareWarp,
-            is_running: true,
-            detected_port: None,
-            adapter_alias: Some("CloudflareWARP".to_string()),
-            adapter_if_index: Some(warp_if),
-            adapter_is_up: true,
-            adapter_gateway: None,
-            remote_server_ip: None,
-            warp_current_mode: Some("warp+doh".to_string()),
-        };
-        let settings_proxy = VpnNodeSettings {
-            warp_mode: WarpMode::Proxy,
-            ..Default::default()
-        };
-        let resolved_proxy = preflight_and_resolve_vpn(
-            VpnProvider::CloudflareWarp,
-            &settings_proxy,
-            &detected_proxy,
-        )
-        .expect("preflight warp proxy");
-        assert_eq!(resolved_proxy.warp_mode, WarpMode::Proxy);
-        assert_eq!(resolved_proxy.warp_socks_port, Some(40000));
-
-        let entry_proxy = neutralize_vpn(
-            &ops_proxy,
-            VpnProvider::CloudflareWarp,
-            &resolved_proxy,
-            &detected_proxy,
-        )
-        .expect("neutralize warp proxy");
-
-        assert_eq!(ops_proxy.warp_set_calls(), vec!["proxy".to_string()]);
-        assert_eq!(entry_proxy.warp_previous_mode.as_deref(), Some("warp+doh"));
-
-        restore_vpn(&ops_proxy, &entry_proxy).expect("restore warp proxy");
-        assert_eq!(
-            ops_proxy.warp_set_calls(),
-            vec!["proxy".to_string(), "warp+doh".to_string()]
-        );
-
-        // Part C: If WARP is already in proxy mode, do not switch or record warp_previous_mode
-        let ops_already_proxy = MockNetworkOps::new();
-        ops_already_proxy.set_warp_mode(Some("proxy"));
-        let entry_already = neutralize_vpn(
-            &ops_already_proxy,
-            VpnProvider::CloudflareWarp,
-            &resolved_proxy,
-            &detected_proxy,
-        )
-        .expect("neutralize warp already in proxy");
-        assert!(ops_already_proxy.warp_set_calls().is_empty());
-        assert_eq!(entry_already.warp_previous_mode, None);
-    }
-
-    #[test]
     fn test_openvpn_neutralizes_hijack_routes_and_pins_dco_host_route() {
         let ovpn_if = 44;
         let phys_if = 7;
@@ -1099,7 +863,6 @@ mod tests {
             adapter_is_up: true,
             adapter_gateway: None,
             remote_server_ip: Some("203.0.113.45".to_string()),
-            warp_current_mode: None,
         };
         let settings = VpnNodeSettings::default();
         let resolved = preflight_and_resolve_vpn(VpnProvider::OpenVpn, &settings, &detected)
@@ -1177,7 +940,6 @@ mod tests {
             adapter_is_up: false,
             adapter_gateway: None,
             remote_server_ip: None,
-            warp_current_mode: None,
         };
         let err = preflight_and_resolve_vpn(
             VpnProvider::Karing,
@@ -1200,7 +962,6 @@ mod tests {
             adapter_is_up: false,
             adapter_gateway: None,
             remote_server_ip: None,
-            warp_current_mode: None,
         };
         let karing_settings = VpnNodeSettings {
             karing_port_override: Some(7890),
@@ -1228,7 +989,6 @@ mod tests {
             adapter_is_up: true,
             adapter_gateway: None,
             remote_server_ip: Some("198.51.100.10".to_string()),
-            warp_current_mode: None,
         };
         let ovpn_settings = VpnNodeSettings {
             openvpn_adapter_override: Some("Custom OVPN".to_string()),
@@ -1266,7 +1026,7 @@ mod tests {
         ops.set_fail_remove_prefix(Some("0.0.0.0/0"));
 
         let entry = VpnRecoveryEntry {
-            provider: VpnProvider::CloudflareWarp,
+            provider: VpnProvider::OpenVpn,
             removed_routes: vec![route(if_idx, "0.0.0.0/1", "10.9.0.1", 5, false)],
             added_routes: vec![route(if_idx, "0.0.0.0/0", "10.9.0.1", 500, false)],
             metric_snapshots: vec![InterfaceMetricSnapshot {
@@ -1275,18 +1035,16 @@ mod tests {
                 original_metric: 12,
                 automatic_metric: false,
             }],
-            warp_previous_mode: Some("warp".to_string()),
         };
 
         let err = restore_vpn(&ops, &entry).expect_err("remove_route failure is reported");
         assert!(matches!(err, VpnAdapterError::NetOps(_)));
 
-        // Even though removing the added route failed, metric, removed_routes, and warp mode were restored!
+        // Even though removing the added route failed, metric and removed_routes were restored!
         assert_eq!(ops.metric_for(if_idx, false).original_metric, 12);
         assert!(ops
             .routes_for(if_idx, false)
             .contains(&route(if_idx, "0.0.0.0/1", "10.9.0.1", 5, false)));
-        assert_eq!(ops.warp_set_calls(), vec!["warp".to_string()]);
     }
 
     #[test]
@@ -1331,7 +1089,6 @@ mod tests {
             adapter_is_up: true,
             adapter_gateway: None,
             remote_server_ip: None,
-            warp_current_mode: None,
         };
         let resolved = preflight_and_resolve_vpn(
             VpnProvider::OpenVpn,
@@ -1390,7 +1147,6 @@ mod tests {
                     original_metric: 10,
                     automatic_metric: false,
                 }],
-                warp_previous_mode: None,
             };
             restore_vpn(&ops, &entry).expect("vanished ephemeral TUN adapter must restore cleanly");
         }
@@ -1410,7 +1166,6 @@ mod tests {
                 original_metric: 5,
                 automatic_metric: false,
             }],
-            warp_previous_mode: None,
         };
         restore_vpn(&ops_existing, &entry_existing).expect("5010 already exists is tolerated");
         assert_eq!(ops_existing.metric_for(live_if, false).original_metric, 5);
@@ -1423,7 +1178,6 @@ mod tests {
             removed_routes: Vec::new(),
             added_routes: vec![route(live_if, "0.0.0.0/0", "10.8.0.1", 500, false)],
             metric_snapshots: Vec::new(),
-            warp_previous_mode: None,
         };
         let err = restore_vpn(&ops_denied, &entry_denied).expect_err("Access Denied must be reported");
         assert!(matches!(
@@ -1433,41 +1187,7 @@ mod tests {
     }
 
     #[test]
-    fn test_preflight_rejects_disconnected_always_on_warp_and_openvpn_when_adapter_down() {
-        let warp_down = DetectedVpnInfo {
-            provider: VpnProvider::CloudflareWarp,
-            is_running: true, // simulates always-on warp-svc.exe running
-            detected_port: None,
-            adapter_alias: Some("CloudflareWARP".to_string()),
-            adapter_if_index: Some(40),
-            adapter_is_up: false,
-            adapter_gateway: None,
-            remote_server_ip: None,
-            warp_current_mode: Some("warp".to_string()),
-        };
-        assert_eq!(
-            preflight_and_resolve_vpn(
-                VpnProvider::CloudflareWarp,
-                &VpnNodeSettings {
-                    warp_mode: WarpMode::Tun,
-                    ..Default::default()
-                },
-                &warp_down
-            ),
-            Err(VpnAdapterError::NotRunning(VpnProvider::CloudflareWarp))
-        );
-        assert_eq!(
-            preflight_and_resolve_vpn(
-                VpnProvider::CloudflareWarp,
-                &VpnNodeSettings {
-                    warp_mode: WarpMode::Proxy,
-                    ..Default::default()
-                },
-                &warp_down
-            ),
-            Err(VpnAdapterError::NotRunning(VpnProvider::CloudflareWarp))
-        );
-
+    fn test_preflight_rejects_disconnected_always_on_openvpn_when_adapter_down() {
         let ovpn_down = DetectedVpnInfo {
             provider: VpnProvider::OpenVpn,
             is_running: true, // simulates always-on ovpnconnector.exe running
@@ -1477,7 +1197,6 @@ mod tests {
             adapter_is_up: false,
             adapter_gateway: None,
             remote_server_ip: None,
-            warp_current_mode: None,
         };
         assert_eq!(
             preflight_and_resolve_vpn(VpnProvider::OpenVpn, &VpnNodeSettings::default(), &ovpn_down),

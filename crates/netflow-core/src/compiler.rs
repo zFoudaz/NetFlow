@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
 
-use crate::model::{NodeKind, ValidatedGraph, ValidatedVpnChain, VpnProvider, WarpMode};
+use crate::model::{NodeKind, ValidatedGraph, ValidatedVpnChain, VpnProvider};
 use crate::validator::canonicalize_exe_name as canonicalize_validator_exe_name;
 
 const TUN_TAG: &str = "NetFlow-TUN";
@@ -35,9 +35,6 @@ const PRIVATE_LAN_CIDRS: [&str; 7] = [
 pub struct ResolvedVpnRuntimeInfo {
     pub provider: VpnProvider,
     pub karing_socks_port: Option<u16>,
-    pub warp_mode: WarpMode,
-    pub warp_socks_port: Option<u16>,
-    pub warp_adapter_alias: Option<String>,
     pub openvpn_adapter_alias: Option<String>,
     pub openvpn_server_ip: Option<String>,
 }
@@ -70,17 +67,6 @@ pub enum CompileError {
     MissingVpnRuntime { provider: VpnProvider },
     #[error("missing SOCKS5 port for Karing")]
     MissingKaringPort,
-    #[error("missing TUN adapter alias for Cloudflare WARP")]
-    MissingWarpAdapterAlias,
-    #[error("missing SOCKS5 port for Cloudflare WARP Proxy mode")]
-    MissingWarpSocksPort,
-    #[error(
-        "Cloudflare WARP in Proxy mode ('{node_id}') cannot chain downstream VPN '{downstream_node_id}'"
-    )]
-    WarpProxyCannotChainDownstream {
-        node_id: String,
-        downstream_node_id: String,
-    },
     #[error("missing virtual adapter alias for OpenVPN")]
     MissingOpenVpnAdapterAlias,
     #[error("invalid OpenVPN server IPv4 address '{value}'")]
@@ -112,7 +98,6 @@ struct ResolvedVpnOutbound {
     outbound_tag: String,
     kind: VpnOutboundKind,
     chained_dco_cidr: Option<String>,
-    is_warp_proxy: bool,
 }
 
 /// Compiles a `ValidatedGraph` and resolved VPN runtime details into a `sing-box` v1.14+ JSON config.
@@ -151,11 +136,6 @@ pub fn compile_singbox_config(input: &CompileInput) -> Result<CompiledConfig, Co
         &mut outbound_to_node_id,
     )?;
 
-    let warp_proxy_tag = vpn_outbounds
-        .iter()
-        .find(|v| v.is_warp_proxy)
-        .map(|v| v.outbound_tag.clone());
-
     let (final_outbound_tag, use_default_direct) = match &input.validated.default_node_id {
         Some(default_id) => {
             let tag = node_to_outbound.get(default_id).ok_or_else(|| {
@@ -168,7 +148,6 @@ pub fn compile_singbox_config(input: &CompileInput) -> Result<CompiledConfig, Co
         None => (DEFAULT_DIRECT_TAG.to_string(), true),
     };
 
-    let final_is_warp_proxy = warp_proxy_tag.as_deref() == Some(final_outbound_tag.as_str());
     let dns_final_tag =
         resolve_dns_final_tag(&final_outbound_tag, &interface_outbounds, &vpn_outbounds);
 
@@ -191,9 +170,7 @@ pub fn compile_singbox_config(input: &CompileInput) -> Result<CompiledConfig, Co
         &input.validated,
         &node_to_outbound,
         &vpn_outbounds,
-        warp_proxy_tag.as_deref(),
         &final_outbound_tag,
-        final_is_warp_proxy,
     )?;
 
     let json = json!({
@@ -281,7 +258,7 @@ fn build_vpn_outbounds(
         let outbound_tag = vpn_outbound_tag(chain.provider).to_string();
         used_tags.insert(outbound_tag.clone());
 
-        let (kind, chained_dco_cidr, is_warp_proxy) = match chain.provider {
+        let (kind, chained_dco_cidr) = match chain.provider {
             VpnProvider::Karing => {
                 let port = chain
                     .settings
@@ -289,45 +266,7 @@ fn build_vpn_outbounds(
                     .or(runtime.karing_socks_port)
                     .filter(|p| *p != 0)
                     .ok_or(CompileError::MissingKaringPort)?;
-                (VpnOutboundKind::Socks { port }, None, false)
-            }
-            VpnProvider::CloudflareWarp => {
-                let effective_mode = if chain.settings.warp_mode == WarpMode::Proxy {
-                    WarpMode::Proxy
-                } else {
-                    runtime.warp_mode
-                };
-                match effective_mode {
-                    WarpMode::Tun => {
-                        let alias = non_empty_trimmed(runtime.warp_adapter_alias.as_deref())
-                            .ok_or(CompileError::MissingWarpAdapterAlias)?;
-                        (
-                            VpnOutboundKind::TunDirect {
-                                adapter_alias: alias,
-                                dns_tag: format!("dns-{outbound_tag}"),
-                            },
-                            None,
-                            false,
-                        )
-                    }
-                    WarpMode::Proxy => {
-                        if let Some(downstream) = validated
-                            .vpn_chains
-                            .iter()
-                            .find(|other| other.upstream_node_id == chain.node_id)
-                        {
-                            return Err(CompileError::WarpProxyCannotChainDownstream {
-                                node_id: chain.node_id.clone(),
-                                downstream_node_id: downstream.node_id.clone(),
-                            });
-                        }
-                        let port = runtime
-                            .warp_socks_port
-                            .filter(|p| *p != 0)
-                            .ok_or(CompileError::MissingWarpSocksPort)?;
-                        (VpnOutboundKind::Socks { port }, None, true)
-                    }
-                }
+                (VpnOutboundKind::Socks { port }, None)
             }
             VpnProvider::OpenVpn => {
                 let alias = non_empty_trimmed(chain.settings.openvpn_adapter_override.as_deref())
@@ -352,7 +291,6 @@ fn build_vpn_outbounds(
                         dns_tag: format!("dns-{outbound_tag}"),
                     },
                     chained_dco_cidr,
-                    false,
                 )
             }
         };
@@ -365,7 +303,6 @@ fn build_vpn_outbounds(
             outbound_tag,
             kind,
             chained_dco_cidr,
-            is_warp_proxy,
         });
     }
 
@@ -455,7 +392,7 @@ fn build_dns_section(
         "rcode": "NOERROR"
     })];
 
-    // VPN daemon processes (WARP, Karing, OpenVPN) must receive real IPv4 DNS
+    // VPN daemon processes (Karing, OpenVPN) must receive real IPv4 DNS
     // answers bound to their root physical interface rather than FakeIPs,
     // otherwise their endpoint health checks and local SOCKS5 dials fail.
     for chain in &validated.vpn_chains {
@@ -560,9 +497,7 @@ fn build_route_section(
     validated: &ValidatedGraph,
     node_to_outbound: &HashMap<String, String>,
     vpn_outbounds: &[ResolvedVpnOutbound],
-    warp_proxy_tag: Option<&str>,
     final_outbound_tag: &str,
-    final_is_warp_proxy: bool,
 ) -> Result<Value, CompileError> {
     // 1. Sniff -> 2. DNS Hijack -> 3. IPv6 Reject -> 4. Private LAN Direct (excluding FakeIP)
     let mut rules = vec![
@@ -616,32 +551,10 @@ fn build_route_section(
 
     for (target_tag, exe_set) in grouped_apps {
         let exes: Vec<String> = exe_set.into_iter().collect();
-        if warp_proxy_tag == Some(target_tag.as_str()) {
-            rules.push(json!({
-                "network": "udp",
-                "process_name": exes,
-                "action": "reject"
-            }));
-            rules.push(json!({
-                "network": "tcp",
-                "process_name": exes,
-                "action": "route",
-                "outbound": target_tag
-            }));
-        } else {
-            rules.push(json!({
-                "process_name": exes,
-                "action": "route",
-                "outbound": target_tag
-            }));
-        }
-    }
-
-    // Reject unlisted UDP before `final` when Default itself is WARP Proxy (TCP-only SOCKS5)
-    if final_is_warp_proxy {
         rules.push(json!({
-            "network": "udp",
-            "action": "reject"
+            "process_name": exes,
+            "action": "route",
+            "outbound": target_tag
         }));
     }
 
@@ -656,7 +569,6 @@ fn build_route_section(
 fn vpn_outbound_tag(provider: VpnProvider) -> &'static str {
     match provider {
         VpnProvider::Karing => "vpn-karing",
-        VpnProvider::CloudflareWarp => "vpn-warp",
         VpnProvider::OpenVpn => "vpn-openvpn",
     }
 }
@@ -664,7 +576,6 @@ fn vpn_outbound_tag(provider: VpnProvider) -> &'static str {
 fn outer_tunnel_processes(provider: VpnProvider) -> &'static [&'static str] {
     match provider {
         VpnProvider::Karing => &["karingservice.exe", "karing.exe"],
-        VpnProvider::CloudflareWarp => &["warp-svc.exe", "cloudflare warp.exe"],
         VpnProvider::OpenVpn => &["openvpn.exe", "ovpnconnector.exe"],
     }
 }
@@ -746,12 +657,7 @@ mod tests {
         }
     }
 
-    fn vpn_node(
-        id: &str,
-        provider: VpnProvider,
-        is_default: bool,
-        warp_mode: WarpMode,
-    ) -> WorkflowNode {
+    fn vpn_node(id: &str, provider: VpnProvider, is_default: bool) -> WorkflowNode {
         WorkflowNode {
             id: id.to_string(),
             x: 0.0,
@@ -759,10 +665,7 @@ mod tests {
             kind: NodeKind::Vpn {
                 provider,
                 is_default,
-                settings: VpnNodeSettings {
-                    warp_mode,
-                    ..Default::default()
-                },
+                settings: VpnNodeSettings::default(),
             },
         }
     }
@@ -790,33 +693,6 @@ mod tests {
         ResolvedVpnRuntimeInfo {
             provider: VpnProvider::Karing,
             karing_socks_port: Some(port),
-            warp_mode: WarpMode::Tun,
-            warp_socks_port: None,
-            warp_adapter_alias: None,
-            openvpn_adapter_alias: None,
-            openvpn_server_ip: None,
-        }
-    }
-
-    fn warp_tun_runtime(alias: &str) -> ResolvedVpnRuntimeInfo {
-        ResolvedVpnRuntimeInfo {
-            provider: VpnProvider::CloudflareWarp,
-            karing_socks_port: None,
-            warp_mode: WarpMode::Tun,
-            warp_socks_port: None,
-            warp_adapter_alias: Some(alias.to_string()),
-            openvpn_adapter_alias: None,
-            openvpn_server_ip: None,
-        }
-    }
-
-    fn warp_proxy_runtime(port: u16) -> ResolvedVpnRuntimeInfo {
-        ResolvedVpnRuntimeInfo {
-            provider: VpnProvider::CloudflareWarp,
-            karing_socks_port: None,
-            warp_mode: WarpMode::Proxy,
-            warp_socks_port: Some(port),
-            warp_adapter_alias: None,
             openvpn_adapter_alias: None,
             openvpn_server_ip: None,
         }
@@ -826,9 +702,6 @@ mod tests {
         ResolvedVpnRuntimeInfo {
             provider: VpnProvider::OpenVpn,
             karing_socks_port: None,
-            warp_mode: WarpMode::Tun,
-            warp_socks_port: None,
-            warp_adapter_alias: None,
             openvpn_adapter_alias: Some(alias.to_string()),
             openvpn_server_ip: server_ip.map(|s| s.to_string()),
         }
@@ -845,20 +718,15 @@ mod tests {
         let graph = WorkflowGraph {
             nodes: vec![
                 iface_node("if-wifi", "Wi-Fi", false),
-                vpn_node("vpn-karing", VpnProvider::Karing, false, WarpMode::Tun),
-                vpn_node(
-                    "vpn-warp",
-                    VpnProvider::CloudflareWarp,
-                    false,
-                    WarpMode::Tun,
-                ),
-                apps_node("apps-warp", &["chrome.exe"]),
+                vpn_node("vpn-karing", VpnProvider::Karing, false),
+                vpn_node("vpn-ovpn", VpnProvider::OpenVpn, false),
+                apps_node("apps-ovpn", &["chrome.exe"]),
                 apps_node("apps-wifi", &["msedge.exe"]),
             ],
             edges: vec![
                 edge("e1", "if-wifi", "vpn-karing"),
-                edge("e2", "vpn-karing", "vpn-warp"),
-                edge("e3", "vpn-warp", "apps-warp"),
+                edge("e2", "vpn-karing", "vpn-ovpn"),
+                edge("e3", "vpn-ovpn", "apps-ovpn"),
                 edge("e4", "if-wifi", "apps-wifi"),
             ],
         };
@@ -867,8 +735,8 @@ mod tests {
         let mut vpn_runtime = HashMap::new();
         vpn_runtime.insert(VpnProvider::Karing, karing_runtime(3067));
         vpn_runtime.insert(
-            VpnProvider::CloudflareWarp,
-            warp_tun_runtime("CloudflareWARP"),
+            VpnProvider::OpenVpn,
+            openvpn_runtime("OpenVPN Wintun", None),
         );
 
         let compiled = compile_singbox_config(&CompileInput {
@@ -930,9 +798,9 @@ mod tests {
         assert_eq!(
             compiled
                 .outbound_to_node_id
-                .get("vpn-warp")
+                .get("vpn-openvpn")
                 .map(String::as_str),
-            Some("vpn-warp")
+            Some("vpn-ovpn")
         );
 
         // Strict rule ordering
@@ -972,17 +840,19 @@ mod tests {
             .expect("karing outer rule");
         assert_eq!(rules[karing_outer_idx]["outbound"], wifi_tag);
 
-        let warp_outer_idx = rules
+        let ovpn_outer_idx = rules
             .iter()
-            .position(|r| rule_has_process(r, "warp-svc.exe"))
-            .expect("warp outer rule");
-        assert_eq!(rules[warp_outer_idx]["outbound"], "vpn-karing");
+            .position(|r| {
+                rule_has_process(r, "openvpn.exe") && rule_has_process(r, "ovpnconnector.exe")
+            })
+            .expect("openvpn outer rule");
+        assert_eq!(rules[ovpn_outer_idx]["outbound"], "vpn-karing");
 
         let chrome_idx = rules
             .iter()
             .position(|r| rule_has_process(r, "chrome.exe"))
             .expect("chrome app rule");
-        assert_eq!(rules[chrome_idx]["outbound"], "vpn-warp");
+        assert_eq!(rules[chrome_idx]["outbound"], "vpn-openvpn");
 
         let edge_idx = rules
             .iter()
@@ -991,9 +861,9 @@ mod tests {
         assert_eq!(rules[edge_idx]["outbound"], wifi_tag);
 
         assert!(3 < karing_outer_idx);
-        assert!(karing_outer_idx < warp_outer_idx);
-        assert!(warp_outer_idx < chrome_idx);
-        assert!(warp_outer_idx < edge_idx);
+        assert!(karing_outer_idx < ovpn_outer_idx);
+        assert!(ovpn_outer_idx < chrome_idx);
+        assert!(ovpn_outer_idx < edge_idx);
 
         assert_eq!(json["route"]["final"], "default-direct");
     }
@@ -1003,8 +873,8 @@ mod tests {
         let graph = WorkflowGraph {
             nodes: vec![
                 iface_node("if-wifi", "Wi-Fi", false),
-                vpn_node("vpn-karing", VpnProvider::Karing, false, WarpMode::Tun),
-                vpn_node("vpn-ovpn", VpnProvider::OpenVpn, false, WarpMode::Tun),
+                vpn_node("vpn-karing", VpnProvider::Karing, false),
+                vpn_node("vpn-ovpn", VpnProvider::OpenVpn, false),
                 apps_node("apps-1", &["firefox.exe"]),
             ],
             edges: vec![
@@ -1066,7 +936,7 @@ mod tests {
         let direct_iface_graph = WorkflowGraph {
             nodes: vec![
                 iface_node("if-wifi", "Wi-Fi", false),
-                vpn_node("vpn-ovpn", VpnProvider::OpenVpn, false, WarpMode::Tun),
+                vpn_node("vpn-ovpn", VpnProvider::OpenVpn, false),
                 apps_node("apps-1", &["firefox.exe"]),
             ],
             edges: vec![
@@ -1100,76 +970,11 @@ mod tests {
     }
 
     #[test]
-    fn test_compiles_warp_proxy_mode_blocks_udp_for_warp_apps() {
-        let graph = WorkflowGraph {
-            nodes: vec![
-                iface_node("if-wifi", "Wi-Fi", false),
-                vpn_node(
-                    "vpn-warp",
-                    VpnProvider::CloudflareWarp,
-                    false,
-                    WarpMode::Proxy,
-                ),
-                apps_node("apps-warp", &["chrome.exe", "discord.exe"]),
-            ],
-            edges: vec![
-                edge("e1", "if-wifi", "vpn-warp"),
-                edge("e2", "vpn-warp", "apps-warp"),
-            ],
-        };
-
-        let validated = validate_graph(&graph).expect("valid graph");
-        let mut vpn_runtime = HashMap::new();
-        vpn_runtime.insert(VpnProvider::CloudflareWarp, warp_proxy_runtime(40000));
-
-        let compiled = compile_singbox_config(&CompileInput {
-            validated,
-            default_physical_interface: "Wi-Fi".to_string(),
-            vpn_runtime,
-            clash_api_port: 9090,
-            log_path: PathBuf::from("sing-box.log"),
-        })
-        .expect("compile should succeed");
-
-        let warp_outbound = compiled.json["outbounds"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|o| o["tag"] == "vpn-warp")
-            .expect("vpn-warp outbound");
-        assert_eq!(warp_outbound["type"], "socks");
-        assert_eq!(warp_outbound["server"], "127.0.0.1");
-        assert_eq!(warp_outbound["server_port"], 40000);
-
-        let rules = compiled.json["route"]["rules"].as_array().unwrap();
-        let udp_reject_idx = rules
-            .iter()
-            .position(|r| {
-                r["network"] == "udp"
-                    && r["action"] == "reject"
-                    && rule_has_process(r, "chrome.exe")
-                    && rule_has_process(r, "discord.exe")
-            })
-            .expect("UDP reject rule for WARP proxy apps");
-
-        let tcp_route_idx = rules
-            .iter()
-            .position(|r| {
-                r["outbound"] == "vpn-warp"
-                    && rule_has_process(r, "chrome.exe")
-                    && rule_has_process(r, "discord.exe")
-            })
-            .expect("TCP route rule for WARP proxy apps");
-
-        assert!(udp_reject_idx < tcp_route_idx);
-    }
-
-    #[test]
     fn test_compiles_user_selected_default_vpn_as_final_and_normalizes_exe_names() {
         let mut validated = validate_graph(&WorkflowGraph {
             nodes: vec![
                 iface_node("if-wifi", "Wi-Fi", false),
-                vpn_node("vpn-karing", VpnProvider::Karing, true, WarpMode::Tun),
+                vpn_node("vpn-karing", VpnProvider::Karing, true),
                 iface_node("if-lan1", "LAN 1", false),
                 apps_node("apps-lan", &[" Chrome.EXE ", r"C:\Tools\IDMan.EXE"]),
             ],
@@ -1276,16 +1081,10 @@ mod tests {
         let graph = WorkflowGraph {
             nodes: vec![
                 iface_node("if-wifi", "Wi-Fi", false),
-                vpn_node("vpn-karing", VpnProvider::Karing, false, WarpMode::Tun),
-                vpn_node("vpn-ovpn", VpnProvider::OpenVpn, false, WarpMode::Tun),
+                vpn_node("vpn-karing", VpnProvider::Karing, false),
+                vpn_node("vpn-ovpn", VpnProvider::OpenVpn, false),
                 apps_node("apps-1", &["firefox.exe", "steam.exe"]),
                 iface_node("if-lan1", "LAN 1", false),
-                vpn_node(
-                    "vpn-warp",
-                    VpnProvider::CloudflareWarp,
-                    false,
-                    WarpMode::Proxy,
-                ),
                 apps_node("apps-2", &["chrome.exe"]),
                 iface_node("if-lan2", "LAN 2", true),
                 apps_node("apps-3", &["idm.exe"]),
@@ -1294,9 +1093,8 @@ mod tests {
                 edge("e1", "if-wifi", "vpn-karing"),
                 edge("e2", "vpn-karing", "vpn-ovpn"),
                 edge("e3", "vpn-ovpn", "apps-1"),
-                edge("e4", "if-lan1", "vpn-warp"),
-                edge("e5", "vpn-warp", "apps-2"),
-                edge("e6", "if-lan2", "apps-3"),
+                edge("e4", "if-lan1", "apps-2"),
+                edge("e5", "if-lan2", "apps-3"),
             ],
         };
 
@@ -1307,7 +1105,6 @@ mod tests {
             VpnProvider::OpenVpn,
             openvpn_runtime("OpenVPN Data Channel Offload", Some("203.0.113.10")),
         );
-        vpn_runtime.insert(VpnProvider::CloudflareWarp, warp_proxy_runtime(40000));
 
         let compiled = compile_singbox_config(&CompileInput {
             validated,
@@ -1321,42 +1118,37 @@ mod tests {
         assert_eq!(compiled.json["dns"]["final"], "dns-iface-lan-2");
         assert_passes_real_singbox_check(&compiled.json);
 
-        // Also validate a default-direct + WARP TUN chained configuration
-        let tun_graph = WorkflowGraph {
+        // Also validate a default-direct + Karing -> OpenVPN chained configuration
+        let chained_graph = WorkflowGraph {
             nodes: vec![
                 iface_node("if-wifi", "Wi-Fi", false),
-                vpn_node("vpn-karing", VpnProvider::Karing, false, WarpMode::Tun),
-                vpn_node(
-                    "vpn-warp",
-                    VpnProvider::CloudflareWarp,
-                    false,
-                    WarpMode::Tun,
-                ),
+                vpn_node("vpn-karing", VpnProvider::Karing, false),
+                vpn_node("vpn-ovpn", VpnProvider::OpenVpn, false),
                 apps_node("apps-1", &["chrome.exe"]),
             ],
             edges: vec![
                 edge("e1", "if-wifi", "vpn-karing"),
-                edge("e2", "vpn-karing", "vpn-warp"),
-                edge("e3", "vpn-warp", "apps-1"),
+                edge("e2", "vpn-karing", "vpn-ovpn"),
+                edge("e3", "vpn-ovpn", "apps-1"),
             ],
         };
-        let mut tun_rt = HashMap::new();
-        tun_rt.insert(VpnProvider::Karing, karing_runtime(3067));
-        tun_rt.insert(
-            VpnProvider::CloudflareWarp,
-            warp_tun_runtime("CloudflareWARP"),
+        let mut chained_rt = HashMap::new();
+        chained_rt.insert(VpnProvider::Karing, karing_runtime(3067));
+        chained_rt.insert(
+            VpnProvider::OpenVpn,
+            openvpn_runtime("OpenVPN Wintun", None),
         );
-        let tun_compiled = compile_singbox_config(&CompileInput {
-            validated: validate_graph(&tun_graph).unwrap(),
+        let chained_compiled = compile_singbox_config(&CompileInput {
+            validated: validate_graph(&chained_graph).unwrap(),
             default_physical_interface: "Wi-Fi".to_string(),
-            vpn_runtime: tun_rt,
+            vpn_runtime: chained_rt,
             clash_api_port: 9090,
             log_path: PathBuf::from("sing-box.log"),
         })
         .expect("compile should succeed");
 
-        assert_eq!(tun_compiled.json["dns"]["final"], "dns-default");
-        assert_passes_real_singbox_check(&tun_compiled.json);
+        assert_eq!(chained_compiled.json["dns"]["final"], "dns-default");
+        assert_passes_real_singbox_check(&chained_compiled.json);
     }
 
     #[test]
@@ -1364,7 +1156,7 @@ mod tests {
         let graph = WorkflowGraph {
             nodes: vec![
                 iface_node("if-wifi", "Wi-Fi", false),
-                vpn_node("vpn-karing", VpnProvider::Karing, false, WarpMode::Tun),
+                vpn_node("vpn-karing", VpnProvider::Karing, false),
                 apps_node("apps-1", &["chrome.exe"]),
             ],
             edges: vec![
@@ -1415,9 +1207,6 @@ mod tests {
             ResolvedVpnRuntimeInfo {
                 provider: VpnProvider::Karing,
                 karing_socks_port: None,
-                warp_mode: WarpMode::Tun,
-                warp_socks_port: None,
-                warp_adapter_alias: None,
                 openvpn_adapter_alias: None,
                 openvpn_server_ip: None,
             },
@@ -1436,8 +1225,8 @@ mod tests {
         let ovpn_graph = WorkflowGraph {
             nodes: vec![
                 iface_node("if-wifi", "Wi-Fi", false),
-                vpn_node("vpn-karing", VpnProvider::Karing, false, WarpMode::Tun),
-                vpn_node("vpn-ovpn", VpnProvider::OpenVpn, false, WarpMode::Tun),
+                vpn_node("vpn-karing", VpnProvider::Karing, false),
+                vpn_node("vpn-ovpn", VpnProvider::OpenVpn, false),
             ],
             edges: vec![
                 edge("e1", "if-wifi", "vpn-karing"),
@@ -1467,23 +1256,18 @@ mod tests {
     }
 
     #[test]
-    fn test_warp_proxy_default_blocks_fallback_udp_and_deduplicates_interface_tags() {
+    fn test_deduplicates_interface_tags_with_default_vpn() {
         let graph = WorkflowGraph {
             nodes: vec![
                 iface_node("if-wifi-1", "Wi-Fi", false),
                 iface_node("if-wifi-2", "Wi-Fi", false),
-                vpn_node(
-                    "vpn-warp",
-                    VpnProvider::CloudflareWarp,
-                    true,
-                    WarpMode::Proxy,
-                ),
+                vpn_node("vpn-karing", VpnProvider::Karing, true),
             ],
-            edges: vec![edge("e1", "if-wifi-1", "vpn-warp")],
+            edges: vec![edge("e1", "if-wifi-1", "vpn-karing")],
         };
 
         let mut vpn_runtime = HashMap::new();
-        vpn_runtime.insert(VpnProvider::CloudflareWarp, warp_proxy_runtime(40000));
+        vpn_runtime.insert(VpnProvider::Karing, karing_runtime(3067));
 
         let compiled = compile_singbox_config(&CompileInput {
             validated: validate_graph(&graph).unwrap(),
@@ -1494,62 +1278,10 @@ mod tests {
         })
         .expect("compile should succeed");
 
-        assert_eq!(compiled.json["route"]["final"], "vpn-warp");
-        let rules = compiled.json["route"]["rules"].as_array().unwrap();
-        let last_rule = rules.last().expect("trailing fallback UDP reject rule");
-        assert_eq!(last_rule["network"], "udp");
-        assert_eq!(last_rule["action"], "reject");
-
+        assert_eq!(compiled.json["route"]["final"], "vpn-karing");
         assert_eq!(compiled.outbound_to_node_id.len(), 3);
         let tags: HashSet<&String> = compiled.outbound_to_node_id.keys().collect();
         assert_eq!(tags.len(), 3);
-    }
-
-    #[test]
-    fn test_rejects_warp_proxy_runtime_override_when_chained_upstream_of_vpn() {
-        let graph = WorkflowGraph {
-            nodes: vec![
-                iface_node("if-wifi", "Wi-Fi", false),
-                vpn_node(
-                    "vpn-warp",
-                    VpnProvider::CloudflareWarp,
-                    false,
-                    WarpMode::Tun,
-                ),
-                vpn_node("vpn-ovpn", VpnProvider::OpenVpn, false, WarpMode::Tun),
-                apps_node("apps-1", &["firefox.exe"]),
-            ],
-            edges: vec![
-                edge("e1", "if-wifi", "vpn-warp"),
-                edge("e2", "vpn-warp", "vpn-ovpn"),
-                edge("e3", "vpn-ovpn", "apps-1"),
-            ],
-        };
-
-        let validated = validate_graph(&graph).expect("WARP Tun -> OpenVPN validates cleanly");
-        let mut vpn_runtime = HashMap::new();
-        vpn_runtime.insert(VpnProvider::CloudflareWarp, warp_proxy_runtime(40000));
-        vpn_runtime.insert(
-            VpnProvider::OpenVpn,
-            openvpn_runtime("OpenVPN Data Channel Offload", Some("203.0.113.10")),
-        );
-
-        let err = compile_singbox_config(&CompileInput {
-            validated,
-            default_physical_interface: "Wi-Fi".to_string(),
-            vpn_runtime,
-            clash_api_port: 9090,
-            log_path: PathBuf::from("sing-box.log"),
-        })
-        .expect_err("runtime WarpMode::Proxy with downstream VPN must fail compilation");
-
-        assert_eq!(
-            err,
-            CompileError::WarpProxyCannotChainDownstream {
-                node_id: "vpn-warp".to_string(),
-                downstream_node_id: "vpn-ovpn".to_string(),
-            }
-        );
     }
 
     #[test]
@@ -1557,14 +1289,22 @@ mod tests {
         let graph = WorkflowGraph {
             nodes: vec![
                 iface_node("if-wifi", "Wi-Fi", false),
-                vpn_node("vpn-warp", VpnProvider::CloudflareWarp, true, WarpMode::Proxy),
+                vpn_node("vpn-karing", VpnProvider::Karing, false),
+                vpn_node("vpn-ovpn", VpnProvider::OpenVpn, true),
             ],
-            edges: vec![edge("e1", "if-wifi", "vpn-warp")],
+            edges: vec![
+                edge("e1", "if-wifi", "vpn-karing"),
+                edge("e2", "vpn-karing", "vpn-ovpn"),
+            ],
         };
 
         let validated = validate_graph(&graph).expect("graph should validate");
         let mut vpn_runtime = HashMap::new();
-        vpn_runtime.insert(VpnProvider::CloudflareWarp, warp_proxy_runtime(40000));
+        vpn_runtime.insert(VpnProvider::Karing, karing_runtime(3067));
+        vpn_runtime.insert(
+            VpnProvider::OpenVpn,
+            openvpn_runtime("OpenVPN Wintun", None),
+        );
 
         let compiled = compile_singbox_config(&CompileInput {
             validated,
@@ -1579,19 +1319,32 @@ mod tests {
             .as_array()
             .expect("dns.rules array");
 
-        let warp_dns_idx = dns_rules
+        let karing_dns_idx = dns_rules
             .iter()
-            .position(|r| rule_has_process(r, "warp-svc.exe"))
-            .expect("warp-svc.exe must have a real DNS rule");
+            .position(|r| {
+                rule_has_process(r, "karingservice.exe") && rule_has_process(r, "karing.exe")
+            })
+            .expect("karingservice.exe/karing.exe must have a real DNS rule");
+        let ovpn_dns_idx = dns_rules
+            .iter()
+            .position(|r| {
+                rule_has_process(r, "openvpn.exe") && rule_has_process(r, "ovpnconnector.exe")
+            })
+            .expect("openvpn.exe/ovpnconnector.exe must have a real DNS rule");
         let fakeip_idx = dns_rules
             .iter()
             .position(|r| r["server"] == DNS_FAKEIP_TAG)
             .expect("fakeip rule must exist");
 
         assert!(
-            warp_dns_idx < fakeip_idx,
-            "VPN daemon DNS rule must precede FakeIP rule so WARP never receives 198.18.x.x FakeIPs"
+            karing_dns_idx < fakeip_idx,
+            "Karing daemon DNS rule must precede FakeIP rule so Karing never receives 198.18.x.x FakeIPs"
         );
-        assert_eq!(dns_rules[warp_dns_idx]["server"], "dns-iface-wi-fi");
+        assert!(
+            ovpn_dns_idx < fakeip_idx,
+            "OpenVPN daemon DNS rule must precede FakeIP rule so OpenVPN never receives 198.18.x.x FakeIPs"
+        );
+        assert_eq!(dns_rules[karing_dns_idx]["server"], "dns-iface-wi-fi");
+        assert_eq!(dns_rules[ovpn_dns_idx]["server"], "dns-iface-wi-fi");
     }
 }

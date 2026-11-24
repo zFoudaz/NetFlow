@@ -35,9 +35,7 @@ export function VpnNode({ data, selected }: NodeProps<VpnFlowNode>) {
   const summaryText =
     provider === "karing"
       ? `Port: ${settings.karingPortOverride ?? vpnInfo?.detectedPort ?? "Auto"}`
-      : provider === "cloudflareWarp"
-        ? `Mode: ${settings.warpMode === "proxy" ? "Proxy (TCP-only)" : "TUN (Default)"}`
-        : `Adapter: ${settings.openvpnAdapterOverride || vpnInfo?.adapterAlias || "Auto"}`;
+      : `Adapter: ${settings.openvpnAdapterOverride || vpnInfo?.adapterAlias || "Auto"}`;
 
   const handleKaringPortChange = (raw: string) => {
     const trimmed = raw.trim();
@@ -173,38 +171,6 @@ export function VpnNode({ data, selected }: NodeProps<VpnFlowNode>) {
                 className="w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-100 outline-none focus:border-violet-500"
               />
             </label>
-          )}
-
-          {provider === "cloudflareWarp" && (
-            <div className="space-y-1.5">
-              <span className="block text-[11px] text-slate-400">Routing Mode</span>
-              <div className="grid grid-cols-1 gap-1.5">
-                <button
-                  type="button"
-                  aria-pressed={settings.warpMode === "tun"}
-                  onClick={() => updateVpnSettings(wfNode.id, { warpMode: "tun" })}
-                  className={`rounded border px-2.5 py-1.5 text-left text-[11px] font-medium transition ${
-                    settings.warpMode === "tun"
-                      ? "border-violet-500 bg-violet-500/20 text-violet-200"
-                      : "border-slate-700 bg-slate-900 text-slate-300 hover:bg-slate-800"
-                  }`}
-                >
-                  TUN (Default)
-                </button>
-                <button
-                  type="button"
-                  aria-pressed={settings.warpMode === "proxy"}
-                  onClick={() => updateVpnSettings(wfNode.id, { warpMode: "proxy" })}
-                  className={`rounded border px-2.5 py-1.5 text-left text-[11px] font-medium transition ${
-                    settings.warpMode === "proxy"
-                      ? "border-violet-500 bg-violet-500/20 text-violet-200"
-                      : "border-slate-700 bg-slate-900 text-slate-300 hover:bg-slate-800"
-                  }`}
-                >
-                  Proxy (TCP-only fallback)
-                </button>
-              </div>
-            </div>
           )}
 
           {provider === "openVpn" && (

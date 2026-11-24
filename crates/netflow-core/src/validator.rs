@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::model::{
     AppRouteAssignment, NodeKind, ValidatedGraph, ValidatedVpnChain, ValidationError,
-    ValidationErrorCode, VpnProvider, WarpMode, WorkflowGraph, WorkflowNode,
+    ValidationErrorCode, VpnProvider, WorkflowGraph, WorkflowNode,
 };
 
 /// Normalizes an executable name or path into a lowercase executable filename.
@@ -62,13 +62,7 @@ pub fn validate_graph(graph: &WorkflowGraph) -> Result<ValidatedGraph, Vec<Valid
     let indexed = index_nodes(graph, &mut errors);
     let (incoming, outgoing) = build_adjacency(graph, &indexed.nodes_by_id, &mut errors);
 
-    check_upstream_and_warp_constraints(
-        &indexed.node_order,
-        &indexed.nodes_by_id,
-        &incoming,
-        &outgoing,
-        &mut errors,
-    );
+    check_multiple_upstreams(&indexed.node_order, &incoming, &mut errors);
     detect_cycles(&indexed.node_order, &outgoing, &mut errors);
     check_orphan_vpns(
         &indexed.node_order,
@@ -282,11 +276,9 @@ fn build_adjacency(
     (incoming, outgoing)
 }
 
-fn check_upstream_and_warp_constraints(
+fn check_multiple_upstreams(
     node_order: &[String],
-    nodes_by_id: &HashMap<String, WorkflowNode>,
     incoming: &AdjacencyMap,
-    outgoing: &AdjacencyMap,
     errors: &mut Vec<ValidationError>,
 ) {
     for id in node_order {
@@ -298,36 +290,6 @@ fn check_upstream_and_warp_constraints(
                     vec![id.clone()],
                     format!("Node '{id}' has multiple upstream connections"),
                 );
-            }
-        }
-
-        let Some(node) = nodes_by_id.get(id) else {
-            continue;
-        };
-
-        if let NodeKind::Vpn {
-            provider: VpnProvider::CloudflareWarp,
-            settings,
-            ..
-        } = &node.kind
-        {
-            if settings.warp_mode == WarpMode::Proxy {
-                if let Some(children) = outgoing.get(id) {
-                    for child_id in children {
-                        if let Some(child) = nodes_by_id.get(child_id) {
-                            if matches!(child.kind, NodeKind::Vpn { .. }) {
-                                push_error(
-                                    errors,
-                                    ValidationErrorCode::WarpProxyCannotChainDownstream,
-                                    vec![id.clone(), child_id.clone()],
-                                    format!(
-                                        "Cloudflare WARP in Proxy mode ('{id}') cannot chain downstream VPN '{child_id}'"
-                                    ),
-                                );
-                            }
-                        }
-                    }
-                }
             }
         }
     }
@@ -657,8 +619,8 @@ impl VpnChainBuilder<'_> {
 mod tests {
     use super::*;
     use crate::model::{
-        NodeKind, ValidationErrorCode, VpnNodeSettings, VpnProvider, WarpMode, WorkflowEdge,
-        WorkflowGraph, WorkflowNode,
+        NodeKind, ValidationErrorCode, VpnNodeSettings, VpnProvider, WorkflowEdge, WorkflowGraph,
+        WorkflowNode,
     };
 
     fn iface_node(id: &str, alias: &str, is_default: bool) -> WorkflowNode {
@@ -673,12 +635,7 @@ mod tests {
         }
     }
 
-    fn vpn_node(
-        id: &str,
-        provider: VpnProvider,
-        is_default: bool,
-        warp_mode: WarpMode,
-    ) -> WorkflowNode {
+    fn vpn_node(id: &str, provider: VpnProvider, is_default: bool) -> WorkflowNode {
         WorkflowNode {
             id: id.to_string(),
             x: 0.0,
@@ -686,10 +643,7 @@ mod tests {
             kind: NodeKind::Vpn {
                 provider,
                 is_default,
-                settings: VpnNodeSettings {
-                    warp_mode,
-                    ..Default::default()
-                },
+                settings: VpnNodeSettings::default(),
             },
         }
     }
@@ -718,53 +672,39 @@ mod tests {
         let graph = WorkflowGraph {
             nodes: vec![
                 iface_node("if-wifi", "Wi-Fi", false),
-                vpn_node("vpn-karing", VpnProvider::Karing, false, WarpMode::Tun),
-                vpn_node(
-                    "vpn-warp",
-                    VpnProvider::CloudflareWarp,
-                    false,
-                    WarpMode::Tun,
-                ),
+                vpn_node("vpn-karing", VpnProvider::Karing, false),
+                vpn_node("vpn-ovpn", VpnProvider::OpenVpn, false),
                 apps_node("apps-1", &["chrome.exe"]),
                 iface_node("if-lan1", "LAN 1", false),
-                vpn_node("vpn-ovpn", VpnProvider::OpenVpn, false, WarpMode::Tun),
                 apps_node("apps-2", &["firefox.exe"]),
                 iface_node("if-lan2", "LAN 2", true),
                 apps_node("apps-3", &["idm.exe"]),
             ],
             edges: vec![
                 edge("e1", "if-wifi", "vpn-karing"),
-                edge("e2", "vpn-karing", "vpn-warp"),
-                edge("e3", "vpn-warp", "apps-1"),
-                edge("e4", "if-lan1", "vpn-ovpn"),
-                edge("e5", "vpn-ovpn", "apps-2"),
-                edge("e6", "if-lan2", "apps-3"),
+                edge("e2", "vpn-karing", "vpn-ovpn"),
+                edge("e3", "vpn-ovpn", "apps-1"),
+                edge("e4", "if-lan1", "apps-2"),
+                edge("e5", "if-lan2", "apps-3"),
             ],
         };
 
         let validated = validate_graph(&graph).expect("graph should validate cleanly");
         let providers: Vec<VpnProvider> =
             validated.vpn_chains.iter().map(|c| c.provider).collect();
-        assert_eq!(
-            providers,
-            vec![
-                VpnProvider::Karing,
-                VpnProvider::CloudflareWarp,
-                VpnProvider::OpenVpn
-            ]
-        );
+        assert_eq!(providers, vec![VpnProvider::Karing, VpnProvider::OpenVpn]);
 
         let karing_idx = validated
             .vpn_chains
             .iter()
             .position(|c| c.node_id == "vpn-karing")
             .unwrap();
-        let warp_idx = validated
+        let ovpn_idx = validated
             .vpn_chains
             .iter()
-            .position(|c| c.node_id == "vpn-warp")
+            .position(|c| c.node_id == "vpn-ovpn")
             .unwrap();
-        assert!(karing_idx < warp_idx);
+        assert!(karing_idx < ovpn_idx);
 
         assert_eq!(validated.vpn_by_id["vpn-karing"].upstream_node_id, "if-wifi");
         assert_eq!(
@@ -772,26 +712,21 @@ mod tests {
             "Wi-Fi"
         );
         assert_eq!(
-            validated.vpn_by_id["vpn-warp"].upstream_node_id,
+            validated.vpn_by_id["vpn-ovpn"].upstream_node_id,
             "vpn-karing"
         );
         assert_eq!(
-            validated.vpn_by_id["vpn-warp"].root_interface_alias,
-            "Wi-Fi"
-        );
-        assert_eq!(validated.vpn_by_id["vpn-ovpn"].upstream_node_id, "if-lan1");
-        assert_eq!(
             validated.vpn_by_id["vpn-ovpn"].root_interface_alias,
-            "LAN 1"
+            "Wi-Fi"
         );
 
         assert_eq!(
             validated.app_routes["chrome.exe"].target_node_id,
-            "vpn-warp"
+            "vpn-ovpn"
         );
         assert_eq!(
             validated.app_routes["firefox.exe"].target_node_id,
-            "vpn-ovpn"
+            "if-lan1"
         );
         assert_eq!(validated.app_routes["idm.exe"].target_node_id, "if-lan2");
         assert_eq!(validated.default_node_id.as_deref(), Some("if-lan2"));
@@ -801,17 +736,12 @@ mod tests {
     fn test_rejects_vpn_cycle() {
         let graph = WorkflowGraph {
             nodes: vec![
-                vpn_node("vpn-karing", VpnProvider::Karing, false, WarpMode::Tun),
-                vpn_node(
-                    "vpn-warp",
-                    VpnProvider::CloudflareWarp,
-                    false,
-                    WarpMode::Tun,
-                ),
+                vpn_node("vpn-karing", VpnProvider::Karing, false),
+                vpn_node("vpn-ovpn", VpnProvider::OpenVpn, false),
             ],
             edges: vec![
-                edge("e1", "vpn-karing", "vpn-warp"),
-                edge("e2", "vpn-warp", "vpn-karing"),
+                edge("e1", "vpn-karing", "vpn-ovpn"),
+                edge("e2", "vpn-ovpn", "vpn-karing"),
             ],
         };
 
@@ -825,7 +755,7 @@ mod tests {
     fn test_rejects_orphan_vpn_with_apps_or_default() {
         let graph_with_apps = WorkflowGraph {
             nodes: vec![
-                vpn_node("vpn-karing", VpnProvider::Karing, false, WarpMode::Tun),
+                vpn_node("vpn-karing", VpnProvider::Karing, false),
                 apps_node("apps-1", &["chrome.exe"]),
             ],
             edges: vec![edge("e1", "vpn-karing", "apps-1")],
@@ -838,12 +768,7 @@ mod tests {
             .any(|e| e.code == ValidationErrorCode::MissingUpstreamInterface));
 
         let graph_with_default = WorkflowGraph {
-            nodes: vec![vpn_node(
-                "vpn-karing",
-                VpnProvider::Karing,
-                true,
-                WarpMode::Tun,
-            )],
+            nodes: vec![vpn_node("vpn-karing", VpnProvider::Karing, true)],
             edges: vec![],
         };
 
@@ -860,8 +785,8 @@ mod tests {
             nodes: vec![
                 iface_node("if-1", "Wi-Fi", false),
                 iface_node("if-2", "LAN 1", false),
-                vpn_node("vpn-ovpn-1", VpnProvider::OpenVpn, false, WarpMode::Tun),
-                vpn_node("vpn-ovpn-2", VpnProvider::OpenVpn, false, WarpMode::Tun),
+                vpn_node("vpn-ovpn-1", VpnProvider::OpenVpn, false),
+                vpn_node("vpn-ovpn-2", VpnProvider::OpenVpn, false),
             ],
             edges: vec![
                 edge("e1", "if-1", "vpn-ovpn-1"),
@@ -881,7 +806,7 @@ mod tests {
             nodes: vec![
                 iface_node("if-1", "Wi-Fi", false),
                 iface_node("if-2", "LAN 1", false),
-                vpn_node("vpn-karing", VpnProvider::Karing, false, WarpMode::Tun),
+                vpn_node("vpn-karing", VpnProvider::Karing, false),
             ],
             edges: vec![
                 edge("e1", "if-1", "vpn-karing"),
@@ -911,57 +836,11 @@ mod tests {
     }
 
     #[test]
-    fn test_rejects_downstream_vpn_after_warp_proxy() {
-        let graph = WorkflowGraph {
-            nodes: vec![
-                iface_node("if-wifi", "Wi-Fi", false),
-                vpn_node(
-                    "vpn-warp",
-                    VpnProvider::CloudflareWarp,
-                    false,
-                    WarpMode::Proxy,
-                ),
-                vpn_node("vpn-ovpn", VpnProvider::OpenVpn, false, WarpMode::Tun),
-                apps_node("apps-1", &["chrome.exe"]),
-            ],
-            edges: vec![
-                edge("e1", "if-wifi", "vpn-warp"),
-                edge("e2", "vpn-warp", "vpn-ovpn"),
-                edge("e3", "vpn-ovpn", "apps-1"),
-            ],
-        };
-
-        let errors = validate_graph(&graph).expect_err("warp proxy downstream vpn must fail");
-        assert!(errors
-            .iter()
-            .any(|e| e.code == ValidationErrorCode::WarpProxyCannotChainDownstream));
-
-        // Direct Apps downstream of WARP(Proxy) must be allowed.
-        let valid_proxy_graph = WorkflowGraph {
-            nodes: vec![
-                iface_node("if-wifi", "Wi-Fi", false),
-                vpn_node(
-                    "vpn-warp",
-                    VpnProvider::CloudflareWarp,
-                    false,
-                    WarpMode::Proxy,
-                ),
-                apps_node("apps-1", &["chrome.exe"]),
-            ],
-            edges: vec![
-                edge("e1", "if-wifi", "vpn-warp"),
-                edge("e2", "vpn-warp", "apps-1"),
-            ],
-        };
-        assert!(validate_graph(&valid_proxy_graph).is_ok());
-    }
-
-    #[test]
     fn test_rejects_multiple_default_nodes() {
         let graph = WorkflowGraph {
             nodes: vec![
                 iface_node("if-wifi", "Wi-Fi", true),
-                vpn_node("vpn-karing", VpnProvider::Karing, true, WarpMode::Tun),
+                vpn_node("vpn-karing", VpnProvider::Karing, true),
             ],
             edges: vec![edge("e1", "if-wifi", "vpn-karing")],
         };
@@ -1080,7 +959,7 @@ mod tests {
             nodes: vec![
                 iface_node("if-wifi", "Wi-Fi", false),
                 apps_node("apps-1", &["chrome.exe"]),
-                vpn_node("vpn-karing", VpnProvider::Karing, false, WarpMode::Tun),
+                vpn_node("vpn-karing", VpnProvider::Karing, false),
             ],
             edges: vec![
                 edge("e1", "if-wifi", "apps-1"),
@@ -1097,7 +976,7 @@ mod tests {
         let incoming_to_iface = WorkflowGraph {
             nodes: vec![
                 iface_node("if-wifi", "Wi-Fi", false),
-                vpn_node("vpn-karing", VpnProvider::Karing, false, WarpMode::Tun),
+                vpn_node("vpn-karing", VpnProvider::Karing, false),
             ],
             edges: vec![edge("e1", "vpn-karing", "if-wifi")],
         };
@@ -1111,17 +990,28 @@ mod tests {
 
     #[test]
     fn test_serde_camel_case_serialization() {
-        let node = vpn_node(
-            "vpn-1",
-            VpnProvider::CloudflareWarp,
-            true,
-            WarpMode::Proxy,
-        );
+        let node = WorkflowNode {
+            id: "vpn-1".to_string(),
+            x: 0.0,
+            y: 0.0,
+            kind: NodeKind::Vpn {
+                provider: VpnProvider::OpenVpn,
+                is_default: true,
+                settings: VpnNodeSettings {
+                    karing_port_override: None,
+                    openvpn_adapter_override: Some("OpenVPN Wintun".to_string()),
+                    openvpn_server_ip_override: None,
+                },
+            },
+        };
         let json = serde_json::to_value(&node).expect("serialize node");
         assert_eq!(json["kind"]["type"], "vpn");
-        assert_eq!(json["kind"]["provider"], "cloudflareWarp");
+        assert_eq!(json["kind"]["provider"], "openVpn");
         assert_eq!(json["kind"]["isDefault"], true);
-        assert_eq!(json["kind"]["settings"]["warpMode"], "proxy");
+        assert_eq!(
+            json["kind"]["settings"]["openvpnAdapterOverride"],
+            "OpenVPN Wintun"
+        );
 
         let iface = iface_node("if-1", "Wi-Fi", false);
         let iface_json = serde_json::to_value(&iface).expect("serialize interface");

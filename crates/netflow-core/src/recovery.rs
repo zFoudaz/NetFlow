@@ -66,7 +66,6 @@ pub struct VpnRecoveryEntry {
     pub removed_routes: Vec<RouteRecord>,
     pub added_routes: Vec<RouteRecord>,
     pub metric_snapshots: Vec<InterfaceMetricSnapshot>,
-    pub warp_previous_mode: Option<String>,
 }
 
 /// Full crash-recovery snapshot persisted before NetFlow mutates OS network state.
@@ -205,9 +204,9 @@ mod tests {
 
         let mut vpn_entries = HashMap::new();
         vpn_entries.insert(
-            VpnProvider::CloudflareWarp,
+            VpnProvider::OpenVpn,
             VpnRecoveryEntry {
-                provider: VpnProvider::CloudflareWarp,
+                provider: VpnProvider::OpenVpn,
                 removed_routes: vec![
                     RouteRecord {
                         interface_index: 12,
@@ -245,7 +244,6 @@ mod tests {
                         automatic_metric: false,
                     },
                 ],
-                warp_previous_mode: Some("warp".to_string()),
             },
         );
 
@@ -285,7 +283,6 @@ mod tests {
         assert!(raw.contains("\"pinnedHostRoutes\""));
         assert!(raw.contains("\"removedBypassRoutes\""));
         assert!(raw.contains("\"singboxPid\""));
-        assert!(raw.contains("\"warpPreviousMode\""));
         assert!(raw.contains("\"automaticMetric\""));
 
         let loaded = store
@@ -339,7 +336,6 @@ mod tests {
                 original_metric: 5,
                 automatic_metric: false,
             }],
-            warp_previous_mode: None,
         };
 
         assert!(snapshot.insert_vpn_if_absent(baseline_karing.clone()));
@@ -356,7 +352,6 @@ mod tests {
                 is_ipv6: false,
             }],
             metric_snapshots: Vec::new(),
-            warp_previous_mode: None,
         };
 
         assert!(!snapshot.insert_vpn_if_absent(hot_switch_karing));
@@ -371,7 +366,6 @@ mod tests {
             removed_routes: Vec::new(),
             added_routes: Vec::new(),
             metric_snapshots: Vec::new(),
-            warp_previous_mode: None,
         };
         assert!(snapshot.insert_vpn_if_absent(openvpn_entry.clone()));
         assert_eq!(

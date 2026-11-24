@@ -1,8 +1,7 @@
-//! Win32 routing table, interface metric, Windows System Proxy, and Cloudflare WARP CLI
+//! Win32 routing table, interface metric, and Windows System Proxy
 //! operations for NetFlow.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::path::PathBuf;
 
 use thiserror::Error;
 
@@ -27,19 +26,13 @@ pub enum NetOpsError {
         prefix: String,
         next_hop: String,
     },
-    #[error("warp-cli.exe not found in PATH or standard installation directory")]
-    WarpCliNotFound,
-    #[error("warp-cli command failed: {message}")]
-    WarpCliFailed { message: String },
-    #[error("invalid warp-cli mode '{mode}'")]
-    InvalidWarpMode { mode: String },
     #[error("I/O error: {0}")]
     Io(String),
     #[error("Windows network operations are only supported on Windows")]
     UnsupportedPlatform,
 }
 
-/// Abstraction over OS-level routing table, interface metric, System Proxy, and WARP CLI actions.
+/// Abstraction over OS-level routing table, interface metric, and System Proxy actions.
 pub trait WindowsNetworkOps: Send + Sync {
     /// Lists routing table entries, optionally filtered to a specific interface index.
     fn list_routes(
@@ -103,12 +96,6 @@ pub trait WindowsNetworkOps: Send + Sync {
 
     /// Disables Windows System Proxy (`ProxyEnable = 0`) and broadcasts WinINet refresh.
     fn disable_system_proxy(&self) -> Result<(), NetOpsError>;
-
-    /// Queries the current Cloudflare WARP mode via `warp-cli settings`, returning `Ok(None)` if not installed.
-    fn warp_cli_get_mode(&self) -> Result<Option<String>, NetOpsError>;
-
-    /// Switches Cloudflare WARP mode via `warp-cli mode <mode>`.
-    fn warp_cli_set_mode(&self, mode: &str) -> Result<(), NetOpsError>;
 }
 
 /// Real Win32 implementation of [`WindowsNetworkOps`].
@@ -180,14 +167,6 @@ impl WindowsNetworkOps for Win32NetworkOps {
 
     fn disable_system_proxy(&self) -> Result<(), NetOpsError> {
         platform::disable_system_proxy()
-    }
-
-    fn warp_cli_get_mode(&self) -> Result<Option<String>, NetOpsError> {
-        warp_cli_get_mode_impl()
-    }
-
-    fn warp_cli_set_mode(&self, mode: &str) -> Result<(), NetOpsError> {
-        warp_cli_set_mode_impl(mode)
     }
 }
 
@@ -302,110 +281,6 @@ pub(crate) fn parse_ip_addr(addr: &str, is_ipv6: bool) -> Result<IpKind, NetOpsE
         })?;
         Ok(IpKind::V4(parsed.octets()))
     }
-}
-
-/// Parses `warp-cli settings` output into a CLI-compatible `warp-cli mode <arg>` token.
-pub(crate) fn parse_warp_cli_mode(output: &str) -> Option<String> {
-    for line in output.lines() {
-        let trimmed = line.trim();
-        let lower = trimmed.to_ascii_lowercase();
-        let value = if lower.starts_with("mode:") {
-            trimmed.split_once(':').map(|(_, rhs)| rhs)
-        } else if lower.starts_with("operation mode:") {
-            trimmed.split_once(':').map(|(_, rhs)| rhs)
-        } else {
-            None
-        };
-
-        if let Some(raw_val) = value {
-            let token = raw_val.split_whitespace().next().unwrap_or("").trim();
-            if token.is_empty() {
-                continue;
-            }
-            let normalized = match token.to_ascii_lowercase().as_str() {
-                "warp" => "warp".to_string(),
-                "warpwithdnsoverhttps" | "warp+doh" => "warp+doh".to_string(),
-                "warpwithdnsovertls" | "warp+dot" => "warp+dot".to_string(),
-                "dnsoverhttps" | "doh" => "doh".to_string(),
-                "dnsovertls" | "dot" => "dot".to_string(),
-                "proxy" => "proxy".to_string(),
-                "tunnelonly" | "tunnel_only" => "tunnel_only".to_string(),
-                other => other.to_string(),
-            };
-            return Some(normalized);
-        }
-    }
-    None
-}
-
-pub(crate) fn find_warp_cli_path() -> Option<PathBuf> {
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join("warp-cli.exe");
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    for fallback in [
-        r"C:\Program Files\Cloudflare\Cloudflare WARP\warp-cli.exe",
-        r"C:\Program Files (x86)\Cloudflare\Cloudflare WARP\warp-cli.exe",
-    ] {
-        let candidate = PathBuf::from(fallback);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-fn run_warp_cli(args: &[&str]) -> Result<String, NetOpsError> {
-    let exe = find_warp_cli_path().ok_or(NetOpsError::WarpCliNotFound)?;
-    let mut cmd = std::process::Command::new(exe);
-    cmd.args(args);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-
-    let output = cmd
-        .output()
-        .map_err(|err| NetOpsError::Io(format!("failed to execute warp-cli: {err}")))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let detail = if !stderr.is_empty() { stderr } else { stdout };
-        return Err(NetOpsError::WarpCliFailed {
-            message: if detail.is_empty() {
-                format!("exit status {}", output.status)
-            } else {
-                detail
-            },
-        });
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-fn warp_cli_get_mode_impl() -> Result<Option<String>, NetOpsError> {
-    if find_warp_cli_path().is_none() {
-        return Ok(None);
-    }
-    let stdout = run_warp_cli(&["settings"])?;
-    Ok(parse_warp_cli_mode(&stdout))
-}
-
-fn warp_cli_set_mode_impl(mode: &str) -> Result<(), NetOpsError> {
-    let trimmed = mode.trim();
-    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
-        return Err(NetOpsError::InvalidWarpMode {
-            mode: mode.to_string(),
-        });
-    }
-    let _ = run_warp_cli(&["mode", trimmed])?;
-    Ok(())
 }
 
 #[cfg(windows)]
@@ -1206,31 +1081,6 @@ mod tests {
         assert!(parse_cidr_prefix("invalid-prefix", false).is_err());
     }
 
-    #[test]
-    fn test_parses_warp_cli_settings_modes() {
-        assert_eq!(
-            parse_warp_cli_mode("Always On: true\nMode: Warp\n").as_deref(),
-            Some("warp")
-        );
-        assert_eq!(
-            parse_warp_cli_mode("Mode: WarpWithDnsOverHttps\n").as_deref(),
-            Some("warp+doh")
-        );
-        assert_eq!(
-            parse_warp_cli_mode("Operation Mode: Proxy\n").as_deref(),
-            Some("proxy")
-        );
-        assert_eq!(
-            parse_warp_cli_mode("Mode: DnsOverHttps\n").as_deref(),
-            Some("doh")
-        );
-        assert_eq!(
-            parse_warp_cli_mode("Mode: TunnelOnly\n").as_deref(),
-            Some("tunnel_only")
-        );
-        assert_eq!(parse_warp_cli_mode("unrelated output\n"), None);
-    }
-
     #[cfg(windows)]
     #[test]
     fn test_win32_network_ops_read_only_smoke() {
@@ -1320,12 +1170,6 @@ mod tests {
             fn disable_system_proxy(&self) -> Result<(), NetOpsError> {
                 Ok(())
             }
-            fn warp_cli_get_mode(&self) -> Result<Option<String>, NetOpsError> {
-                Ok(None)
-            }
-            fn warp_cli_set_mode(&self, _: &str) -> Result<(), NetOpsError> {
-                Ok(())
-            }
         }
 
         let ops = RecordingOps(Mutex::new(Vec::new()));
@@ -1375,12 +1219,6 @@ mod tests {
                 Ok(())
             }
             fn disable_system_proxy(&self) -> Result<(), NetOpsError> {
-                Ok(())
-            }
-            fn warp_cli_get_mode(&self) -> Result<Option<String>, NetOpsError> {
-                Ok(None)
-            }
-            fn warp_cli_set_mode(&self, _: &str) -> Result<(), NetOpsError> {
                 Ok(())
             }
         }

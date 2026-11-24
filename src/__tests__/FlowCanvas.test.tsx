@@ -65,18 +65,6 @@ const sampleDiscovery: DiscoverySnapshot = {
       adapterIsUp: false,
       adapterGateway: null,
       remoteServerIp: null,
-      warpCurrentMode: null,
-    },
-    {
-      provider: "cloudflareWarp",
-      isRunning: true,
-      detectedPort: 40000,
-      adapterAlias: "CloudflareWARP",
-      adapterIfIndex: 21,
-      adapterIsUp: true,
-      adapterGateway: "172.16.0.1",
-      remoteServerIp: "162.159.193.1",
-      warpCurrentMode: "tun",
     },
     {
       provider: "openVpn",
@@ -87,7 +75,6 @@ const sampleDiscovery: DiscoverySnapshot = {
       adapterIsUp: false,
       adapterGateway: null,
       remoteServerIp: null,
-      warpCurrentMode: null,
     },
   ],
   processes: [
@@ -196,7 +183,7 @@ describe("FlowCanvas, Sidebar, and Custom Nodes", () => {
     cleanup();
   });
 
-  it("test_sidebar_renders_detected_interfaces_and_three_vpns", async () => {
+  it("test_sidebar_renders_detected_interfaces_and_two_vpns", async () => {
     const user = userEvent.setup();
     useNetFlowStore.setState({
       graph: {
@@ -211,7 +198,6 @@ describe("FlowCanvas, Sidebar, and Custom Nodes", () => {
               isDefault: false,
               settings: {
                 karingPortOverride: null,
-                warpMode: "tun",
                 openvpnAdapterOverride: null,
                 openvpnServerIpOverride: null,
               },
@@ -234,7 +220,7 @@ describe("FlowCanvas, Sidebar, and Custom Nodes", () => {
     expect(within(ethItem).getByText("Ethernet")).toBeTruthy();
     expect(within(ethItem).getByText("Down")).toBeTruthy();
 
-    // All 3 VPNs render with live Running/Stopped status
+    // Both supported VPNs render with live Running/Stopped status
     const karingItem = screen.getByTestId("sidebar-vpn-karing");
     expect(within(karingItem).getByText("Karing")).toBeTruthy();
     expect(within(karingItem).getByText("Running")).toBeTruthy();
@@ -244,11 +230,6 @@ describe("FlowCanvas, Sidebar, and Custom Nodes", () => {
       "disabled",
       true
     );
-
-    const warpItem = screen.getByTestId("sidebar-vpn-cloudflareWarp");
-    expect(within(warpItem).getByText("Cloudflare WARP")).toBeTruthy();
-    expect(within(warpItem).getByText("Running")).toBeTruthy();
-    expect(warpItem.getAttribute("draggable")).toBe("true");
 
     const openVpnItem = screen.getByTestId("sidebar-vpn-openVpn");
     expect(within(openVpnItem).getByText("OpenVPN")).toBeTruthy();
@@ -264,15 +245,15 @@ describe("FlowCanvas, Sidebar, and Custom Nodes", () => {
     await user.click(screen.getByRole("button", { name: /Refresh discovery/i }));
     expect(mockTauri.getDiscoverySnapshot).toHaveBeenCalledTimes(1);
 
-    // Quick-add button adds Cloudflare WARP to canvas and marks it On Canvas
-    await user.click(within(warpItem).getByRole("button", { name: /Add Cloudflare WARP VPN/i }));
+    // Quick-add button adds OpenVPN to canvas and marks it On Canvas
+    await user.click(within(openVpnItem).getByRole("button", { name: /Add OpenVPN VPN/i }));
     expect(
       useNetFlowStore
         .getState()
-        .graph.nodes.some((n) => n.kind.type === "vpn" && n.kind.provider === "cloudflareWarp")
+        .graph.nodes.some((n) => n.kind.type === "vpn" && n.kind.provider === "openVpn")
     ).toBe(true);
-    expect(within(warpItem).getByText("On Canvas")).toBeTruthy();
-    expect(warpItem.getAttribute("draggable")).toBe("false");
+    expect(within(openVpnItem).getByText("On Canvas")).toBeTruthy();
+    expect(openVpnItem.getAttribute("draggable")).toBe("false");
   });
 
   it("test_apps_node_adds_and_removes_exe_via_modal", async () => {
@@ -330,7 +311,7 @@ describe("FlowCanvas, Sidebar, and Custom Nodes", () => {
     });
   });
 
-  it("test_vpn_node_settings_popover_switches_warp_mode_and_sets_default", async () => {
+  it("test_vpn_node_settings_popover_updates_karing_port_and_sets_default", async () => {
     const user = userEvent.setup();
     useNetFlowStore.setState({
       graph: {
@@ -342,60 +323,57 @@ describe("FlowCanvas, Sidebar, and Custom Nodes", () => {
             kind: { type: "interface", interfaceAlias: "Wi-Fi", isDefault: true },
           },
           {
-            id: "vpn-warp",
+            id: "vpn-karing",
             x: 360,
             y: 120,
             kind: {
               type: "vpn",
-              provider: "cloudflareWarp",
+              provider: "karing",
               isDefault: false,
               settings: {
                 karingPortOverride: null,
-                warpMode: "tun",
                 openvpnAdapterOverride: null,
                 openvpnServerIpOverride: null,
               },
             },
           },
         ],
-        edges: [{ id: "e1", source: "iface-wifi", target: "vpn-warp" }],
+        edges: [{ id: "e1", source: "iface-wifi", target: "vpn-karing" }],
       },
     });
 
     render(<FlowCanvas />);
 
-    const warpNode = await screen.findByTestId("flow-node-vpn-warp");
-    expect(within(warpNode).getByText("Cloudflare WARP")).toBeTruthy();
-    expect(within(warpNode).getByText("Running")).toBeTruthy();
+    const karingNode = await screen.findByTestId("flow-node-vpn-karing");
+    expect(within(karingNode).getByText("Karing")).toBeTruthy();
+    expect(within(karingNode).getByText("Running")).toBeTruthy();
 
-    // Open VPN settings popover and switch WARP mode from TUN to Proxy
+    // Open VPN settings popover and configure Karing port override
     await user.click(
-      within(warpNode).getByRole("button", { name: /Configure Cloudflare WARP settings/i })
+      within(karingNode).getByRole("button", { name: /Configure Karing settings/i })
     );
-    const proxyBtn = await within(warpNode).findByRole("button", {
-      name: /Proxy \(TCP-only fallback\)/i,
-    });
-    await user.click(proxyBtn);
+    const portInput = await within(karingNode).findByPlaceholderText(/Detected \(3080\)/i);
+    await user.type(portInput, "7890");
 
-    const storeWarpAfterMode = useNetFlowStore
+    const storeKaringAfterPort = useNetFlowStore
       .getState()
-      .graph.nodes.find((n) => n.id === "vpn-warp");
-    expect(storeWarpAfterMode?.kind).toMatchObject({
+      .graph.nodes.find((n) => n.id === "vpn-karing");
+    expect(storeKaringAfterPort?.kind).toMatchObject({
       type: "vpn",
-      provider: "cloudflareWarp",
-      settings: { warpMode: "proxy" },
+      provider: "karing",
+      settings: { karingPortOverride: 7890 },
     });
 
-    // Toggle "Set as Default" on WARP node (clears default from iface-wifi)
-    await user.click(within(warpNode).getByRole("button", { name: /Set as Default/i }));
+    // Toggle "Set as Default" on Karing node (clears default from iface-wifi)
+    await user.click(within(karingNode).getByRole("button", { name: /Set as Default/i }));
 
     const nodes = useNetFlowStore.getState().graph.nodes;
     const wifiAfter = nodes.find((n) => n.id === "iface-wifi");
-    const warpAfter = nodes.find((n) => n.id === "vpn-warp");
-    expect(warpAfter?.kind).toMatchObject({ isDefault: true });
+    const karingAfter = nodes.find((n) => n.id === "vpn-karing");
+    expect(karingAfter?.kind).toMatchObject({ isDefault: true });
     expect(wifiAfter?.kind).toMatchObject({ isDefault: false });
     expect(
-      within(warpNode).getByRole("button", { name: /^DEFAULT$/i }).getAttribute("aria-pressed")
+      within(karingNode).getByRole("button", { name: /^DEFAULT$/i }).getAttribute("aria-pressed")
     ).toBe("true");
   });
 
@@ -419,7 +397,6 @@ describe("FlowCanvas, Sidebar, and Custom Nodes", () => {
               isDefault: false,
               settings: {
                 karingPortOverride: null,
-                warpMode: "tun",
                 openvpnAdapterOverride: null,
                 openvpnServerIpOverride: null,
               },
@@ -494,7 +471,6 @@ describe("FlowCanvas, Sidebar, and Custom Nodes", () => {
             isDefault: false,
             settings: {
               karingPortOverride: null,
-              warpMode: "tun",
               openvpnAdapterOverride: null,
               openvpnServerIpOverride: null,
             },
@@ -510,7 +486,6 @@ describe("FlowCanvas, Sidebar, and Custom Nodes", () => {
             isDefault: false,
             settings: {
               karingPortOverride: null,
-              warpMode: "tun",
               openvpnAdapterOverride: null,
               openvpnServerIpOverride: null,
             },
@@ -645,7 +620,6 @@ describe("FlowCanvas, Sidebar, and Custom Nodes", () => {
               isDefault: false,
               settings: {
                 karingPortOverride: null,
-                warpMode: "tun",
                 openvpnAdapterOverride: null,
                 openvpnServerIpOverride: null,
               },
@@ -661,7 +635,6 @@ describe("FlowCanvas, Sidebar, and Custom Nodes", () => {
               isDefault: false,
               settings: {
                 karingPortOverride: null,
-                warpMode: "tun",
                 openvpnAdapterOverride: null,
                 openvpnServerIpOverride: null,
               },
