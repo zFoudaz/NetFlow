@@ -48,19 +48,19 @@ function getOutboundBadgeClass(node: WorkflowNode | undefined, outboundTag: stri
     tag.startsWith("block-") ||
     tag.startsWith("reject-")
   ) {
-    return "border-rose-500/40 bg-rose-500/15 text-rose-300";
+    return "border-rose-500/40 bg-rose-500/10 text-rose-300";
   }
   if (node?.kind.type === "vpn" || tag.startsWith("vpn-")) {
-    return "border-violet-500/40 bg-violet-500/15 text-violet-300";
+    return "border-teal-500/40 bg-teal-500/10 text-teal-300";
   }
   if (
     node?.kind.type === "interface" ||
     tag.startsWith("if-") ||
     tag.startsWith("iface-")
   ) {
-    return "border-emerald-500/40 bg-emerald-500/15 text-emerald-300";
+    return "border-emerald-500/40 bg-emerald-500/10 text-emerald-300";
   }
-  return "border-slate-600 bg-slate-800 text-slate-300";
+  return "border-[#2E3540] bg-[#161A20] text-[#9CA3AF]";
 }
 
 interface EnrichedConnection {
@@ -120,15 +120,15 @@ export function LiveTrafficDrawer() {
   return (
     <section
       aria-label="Live Traffic Log"
-      className="flex h-64 shrink-0 flex-col border-t border-slate-800 bg-slate-900/95 text-slate-100"
+      className="flex h-64 shrink-0 flex-col border-t border-[#232830] bg-[#111418] text-[#F3F4F6]"
     >
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 px-4 py-2">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#232830] px-4 py-2">
         <div className="flex items-center gap-2">
-          <Activity className="h-4 w-4 text-sky-400" />
-          <h2 className="text-xs font-semibold uppercase tracking-wide text-slate-200">
+          <Activity className="h-4 w-4 text-[#3ECF8E]" />
+          <h2 className="text-xs font-semibold uppercase tracking-wide text-[#F3F4F6]">
             Live Traffic
           </h2>
-          <span className="rounded-full bg-slate-800 px-2 py-0.5 text-[11px] font-medium text-slate-300">
+          <span className="rounded bg-[#161A20] px-2 py-0.5 font-mono text-[11px] font-medium text-[#9CA3AF]">
             {filterQuery.trim()
               ? `${filteredConnections.length} / ${liveConnections.length}`
               : liveConnections.length}
@@ -137,21 +137,21 @@ export function LiveTrafficDrawer() {
 
         <div className="flex items-center gap-2">
           <div className="relative flex items-center">
-            <Search className="pointer-events-none absolute left-2.5 h-3.5 w-3.5 text-slate-400" />
+            <Search className="pointer-events-none absolute left-2.5 h-3.5 w-3.5 text-[#6B7280]" />
             <input
               type="text"
               value={filterQuery}
               onChange={(e) => setFilterQuery(e.target.value)}
               placeholder="Filter process, destination, node, outbound..."
               aria-label="Filter live traffic"
-              className="w-72 rounded-md border border-slate-700 bg-slate-950 py-1 pl-8 pr-7 text-xs text-slate-100 placeholder:text-slate-500 focus:border-sky-500 focus:outline-none"
+              className="w-72 rounded-md border border-[#232830] bg-[#0B0D10] py-1 pl-8 pr-7 text-xs text-[#F3F4F6] placeholder:text-[#6B7280] focus:border-[#3ECF8E] focus:outline-none"
             />
             {filterQuery && (
               <button
                 type="button"
                 onClick={() => setFilterQuery("")}
                 aria-label="Clear filter"
-                className="absolute right-2 rounded p-0.5 text-slate-400 hover:text-slate-200"
+                className="absolute right-2 rounded p-0.5 text-[#6B7280] hover:text-[#F3F4F6]"
               >
                 <X className="h-3 w-3" />
               </button>
@@ -162,7 +162,7 @@ export function LiveTrafficDrawer() {
             type="button"
             onClick={toggleTrafficDrawer}
             aria-label="Close Live Traffic"
-            className="rounded-md p-1 text-slate-400 transition hover:bg-slate-800 hover:text-slate-100"
+            className="rounded p-1 text-[#9CA3AF] transition hover:bg-[#1D222B] hover:text-[#F3F4F6]"
           >
             <X className="h-4 w-4" />
           </button>
@@ -171,16 +171,16 @@ export function LiveTrafficDrawer() {
 
       <div className="min-h-0 flex-1 overflow-auto">
         {liveConnections.length === 0 ? (
-          <div className="flex h-full items-center justify-center px-4 text-xs text-slate-400">
+          <div className="flex h-full items-center justify-center px-4 text-xs text-[#6B7280]">
             No active connections yet — start routing to see live traffic
           </div>
         ) : filteredConnections.length === 0 ? (
-          <div className="flex h-full items-center justify-center px-4 text-xs text-slate-400">
+          <div className="flex h-full items-center justify-center px-4 text-xs text-[#6B7280]">
             No connections match &ldquo;{filterQuery.trim()}&rdquo;.
           </div>
         ) : (
           <table className="w-full border-collapse text-left text-xs">
-            <thead className="sticky top-0 z-10 border-b border-slate-800 bg-slate-900 text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+            <thead className="sticky top-0 z-10 border-b border-[#232830] bg-[#111418] text-[11px] font-medium uppercase tracking-wider text-[#6B7280]">
               <tr>
                 <th className="px-4 py-2">Process</th>
                 <th className="px-4 py-2">Destination</th>
@@ -189,41 +189,41 @@ export function LiveTrafficDrawer() {
                 <th className="px-4 py-2 text-right">Up / Down</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-800/70">
+            <tbody className="divide-y divide-[#1A1F26]">
               {filteredConnections.map(({ conn, nodeLabel, badgeClass }) => (
-                <tr key={conn.id} className="hover:bg-slate-800/40">
-                  <td className="whitespace-nowrap px-4 py-1.5 font-medium text-slate-100">
+                <tr key={conn.id} className="hover:bg-[#161A20]">
+                  <td className="whitespace-nowrap px-4 py-1.5 font-medium text-[#F3F4F6]">
                     {conn.processName}
                   </td>
-                  <td className="whitespace-nowrap px-4 py-1.5 font-mono text-slate-300">
+                  <td className="whitespace-nowrap px-4 py-1.5 font-mono text-[#9CA3AF]">
                     {conn.destination}
                   </td>
-                  <td className="whitespace-nowrap px-4 py-1.5 uppercase text-slate-400">
+                  <td className="whitespace-nowrap px-4 py-1.5 uppercase text-[#6B7280]">
                     {conn.network}
                   </td>
                   <td className="whitespace-nowrap px-4 py-1.5">
                     <div className="inline-flex items-center gap-2">
                       <span
                         data-testid={`outbound-badge-${conn.id}`}
-                        className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${badgeClass}`}
+                        className={`inline-flex items-center rounded border px-2 py-0.5 text-[11px] font-medium ${badgeClass}`}
                       >
                         {nodeLabel}
                       </span>
                       {nodeLabel !== conn.outboundTag && (
-                        <span className="font-mono text-[11px] text-slate-500">
+                        <span className="font-mono text-[11px] text-[#6B7280]">
                           {conn.outboundTag}
                         </span>
                       )}
                     </div>
                   </td>
-                  <td className="whitespace-nowrap px-4 py-1.5 text-right font-mono text-slate-300">
+                  <td className="whitespace-nowrap px-4 py-1.5 text-right font-mono text-[#D1D5DB]">
                     <span className="inline-flex items-center gap-2">
-                      <span className="inline-flex items-center gap-0.5 text-sky-300">
+                      <span className="inline-flex items-center gap-0.5 text-[#14B8A6]">
                         <ArrowUp className="h-3 w-3" />
                         {formatBytes(conn.uploadBytes)}
                       </span>
-                      <span className="text-slate-600">/</span>
-                      <span className="inline-flex items-center gap-0.5 text-emerald-300">
+                      <span className="text-[#4B5563]">/</span>
+                      <span className="inline-flex items-center gap-0.5 text-[#3ECF8E]">
                         <ArrowDown className="h-3 w-3" />
                         {formatBytes(conn.downloadBytes)}
                       </span>

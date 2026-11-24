@@ -1,34 +1,89 @@
 @import "tailwindcss";
 @import "@xyflow/react/dist/style.css";
 
+:root {
+  --nf-bg-canvas: #0b0d10;
+  --nf-bg-panel: #111418;
+  --nf-bg-surface: #161a20;
+  --nf-bg-hover: #1d222b;
+  --nf-border: #232830;
+  --nf-border-strong: #2e3540;
+  --nf-accent: #3ecf8e;
+  --nf-accent-hover: #34b87e;
+  --nf-teal: #14b8a6;
+  --nf-text-primary: #f3f4f6;
+  --nf-text-secondary: #9ca3af;
+  --nf-text-muted: #6b7280;
+}
+
 html,
 body,
 #root {
   height: 100%;
   width: 100%;
   margin: 0;
-  background-color: #020617;
-  color: #f1f5f9;
+  background-color: var(--nf-bg-canvas);
+  color: var(--nf-text-primary);
+  font-family: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+/* Subtle custom scrollbars for dark desktop UI */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #232830;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #2e3540;
+}
+
+/* React Flow flat charcoal controls & minimap */
+.react-flow__controls {
+  box-shadow: none !important;
+  border: 1px solid #232830 !important;
+  border-radius: 6px !important;
+  overflow: hidden;
+  background-color: #111418 !important;
 }
 
 .react-flow__controls-button {
-  background-color: #0f172a;
-  border-bottom-color: #1e293b;
-  color: #cbd5e1;
-  fill: #cbd5e1;
+  background-color: #111418;
+  border-bottom-color: #232830;
+  color: #9ca3af;
+  fill: #9ca3af;
 }
 
 .react-flow__controls-button:hover {
-  background-color: #1e293b;
-  color: #f8fafc;
-  fill: #f8fafc;
+  background-color: #1d222b;
+  color: #f3f4f6;
+  fill: #f3f4f6;
+}
+
+.react-flow__minimap {
+  box-shadow: none !important;
+  border-radius: 6px !important;
 }
 
 .react-flow__attribution {
-  background-color: rgba(15, 23, 42, 0.75) !important;
-  color: #64748b !important;
+  background-color: rgba(17, 20, 24, 0.75) !important;
+  color: #6b7280 !important;
 }
 
 .react-flow__attribution a {
-  color: #94a3b8 !important;
+  color: #9ca3af !important;
+}
+
+/* Calm, minimal animation for active routing paths */
+.react-flow__edge.animated path {
+  stroke-dasharray: 6 4;
+  animation-duration: 1.4s;
 }

@@ -1,4 +1,4 @@
-import { AlertCircle, Star } from "lucide-react";
+import { AlertCircle, Network, Star, Wifi } from "lucide-react";
 import { useNetFlowStore } from "../../store/useNetFlowStore";
 import type {
   ValidationError,
@@ -18,6 +18,10 @@ export const VPN_PROVIDER_LABELS: Record<VpnProvider, string> = {
   karing: "Karing",
   openVpn: "OpenVPN",
 };
+
+export function getInterfaceIcon(alias: string) {
+  return /wi-?fi|wlan/i.test(alias) ? Wifi : Network;
+}
 
 export function createDefaultVpnSettings(): VpnNodeSettings {
   return {
@@ -116,12 +120,12 @@ export function nextQuickAddPosition(
   const sameKindCount = existingNodes.filter((n) => n.kind.type === nodeType).length;
   const xByType: Record<DragNodePayload["type"], number> = {
     interface: 60,
-    vpn: 370,
-    apps: 700,
+    vpn: 360,
+    apps: 660,
   };
   return {
     x: xByType[nodeType] + (sameKindCount % 2) * 24,
-    y: 80 + sameKindCount * 170,
+    y: 80 + sameKindCount * 160,
   };
 }
 
@@ -158,15 +162,15 @@ export function getNodeCardBorderClass(
   isDefault = false
 ): string {
   if (hasIssue) {
-    return "border-rose-500 ring-2 ring-rose-500/40";
+    return "border-rose-500 ring-1 ring-rose-500/40";
   }
   if (selected) {
-    return "border-sky-400 ring-2 ring-sky-500/30";
+    return "border-[#3ECF8E] ring-1 ring-[#3ECF8E]/30";
   }
   if (isDefault) {
-    return "border-amber-400/70";
+    return "border-[#2E3540]";
   }
-  return "border-slate-700/90 hover:border-slate-600";
+  return "border-[#232830] hover:border-[#2E3540]";
 }
 
 interface DefaultTogglePillProps {
@@ -180,13 +184,13 @@ export function DefaultTogglePill({ isDefault, onToggle }: DefaultTogglePillProp
       type="button"
       onClick={onToggle}
       aria-pressed={isDefault}
-      className={`nodrag inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[11px] font-semibold tracking-wide transition ${
+      className={`nodrag inline-flex items-center gap-1.5 rounded border px-2 py-1 text-[11px] font-medium transition ${
         isDefault
-          ? "border-amber-400/60 bg-amber-500/20 text-amber-300"
-          : "border-slate-700 bg-slate-800/80 text-slate-400 hover:border-slate-600 hover:text-slate-200"
+          ? "border-[#3ECF8E]/40 bg-[#3ECF8E]/10 text-[#3ECF8E]"
+          : "border-[#232830] bg-[#161A20] text-[#9CA3AF] hover:border-[#2E3540] hover:text-[#F3F4F6]"
       }`}
     >
-      <Star className={`h-3 w-3 ${isDefault ? "fill-amber-300 text-amber-300" : ""}`} />
+      <Star className={`h-3 w-3 ${isDefault ? "fill-[#3ECF8E] text-[#3ECF8E]" : ""}`} />
       <span>{isDefault ? "DEFAULT" : "Set as Default"}</span>
     </button>
   );
@@ -206,11 +210,11 @@ export function NodeErrorCallout({ errors, tooltip }: NodeErrorCalloutProps) {
     <div
       role="alert"
       title={tooltip}
-      className="mt-2 space-y-1 rounded-md border border-rose-500/40 bg-rose-950/70 px-2.5 py-1.5 text-[11px] leading-snug text-rose-200"
+      className="mt-2 space-y-1 rounded border border-rose-500/35 bg-rose-950/50 px-2 py-1.5 text-[11px] leading-snug text-rose-200"
     >
       {errors.map((err, idx) => (
         <div key={`${err.code}-${idx}`} className="flex items-start gap-1.5">
-          <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-rose-400" />
+          <AlertCircle className="mt-0.5 h-3 w-3 shrink-0 text-rose-400" />
           <span>{err.message}</span>
         </div>
       ))}

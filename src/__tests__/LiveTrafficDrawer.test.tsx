@@ -166,10 +166,10 @@ describe("LiveTrafficDrawer", () => {
     const blockBadge = screen.getByTestId("outbound-badge-conn-3");
     const defaultBadge = screen.getByTestId("outbound-badge-conn-4");
 
-    expect(vpnBadge.className).toMatch(/violet|indigo/);
+    expect(vpnBadge.className).toMatch(/teal/);
     expect(ifaceBadge.className).toMatch(/emerald|teal/);
     expect(blockBadge.className).toMatch(/red|rose/);
-    expect(defaultBadge.className).toMatch(/slate/);
+    expect(defaultBadge.className).toMatch(/#161A20|#9CA3AF/);
   });
 
   it("shows no-match state, clears filter, and resolves Karing/OpenVPN labels with GB formatting", async () => {

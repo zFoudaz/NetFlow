@@ -15,6 +15,7 @@ import {
   type IsValidConnection,
   type NodeChange,
   type NodeTypes,
+  type OnSelectionChangeParams,
 } from "@xyflow/react";
 import { useCallback, useEffect, useRef, useState, type DragEvent, type MouseEvent } from "react";
 import { useNetFlowStore } from "../store/useNetFlowStore";
@@ -160,11 +161,14 @@ function toFlowEdges(
       engineStatus.nodeHealth[wfEdge.source] === "dropped" ||
       engineStatus.nodeHealth[wfEdge.target] === "dropped";
 
+    const isSelected = Boolean(prev?.selected);
     const stroke = hasDroppedEndpoint
       ? "#f43f5e"
       : isActive
-        ? "#38bdf8"
-        : "#64748b";
+        ? "#3ECF8E"
+        : isSelected
+          ? "#9CA3AF"
+          : "#4B5563";
 
     return {
       id: wfEdge.id,
@@ -176,7 +180,7 @@ function toFlowEdges(
       selected: prev?.selected,
       style: {
         stroke,
-        strokeWidth: isActive ? 2.25 : 1.75,
+        strokeWidth: isActive || isSelected ? 2 : 1.5,
       },
     };
   });
@@ -185,10 +189,12 @@ function toFlowEdges(
 function FlowCanvasInner() {
   const graph = useNetFlowStore((s) => s.graph);
   const engineStatus = useNetFlowStore((s) => s.engineStatus);
+  const fitViewRequestCount = useNetFlowStore((s) => s.fitViewRequestCount);
   const addNode = useNetFlowStore((s) => s.addNode);
   const updateGraph = useNetFlowStore((s) => s.updateGraph);
+  const setSelectedNodeId = useNetFlowStore((s) => s.setSelectedNodeId);
 
-  const { screenToFlowPosition } = useReactFlow<FlowNode, Edge>();
+  const { screenToFlowPosition, fitView } = useReactFlow<FlowNode, Edge>();
 
   const rfNodesRef = useRef<FlowNode[]>(toFlowNodes(graph.nodes, []));
   const [rfNodes, setRfNodes] = useState<FlowNode[]>(rfNodesRef.current);
@@ -207,6 +213,12 @@ function FlowCanvasInner() {
     rfEdgesRef.current = synced;
     setRfEdges(synced);
   }, [graph.edges, engineStatus]);
+
+  useEffect(() => {
+    if (fitViewRequestCount > 0) {
+      void fitView({ padding: 0.25, duration: 200 });
+    }
+  }, [fitViewRequestCount, fitView]);
 
   const onNodesChange = useCallback(
     (changes: NodeChange<FlowNode>[]) => {
@@ -270,6 +282,24 @@ function FlowCanvasInner() {
     },
     [updateGraph]
   );
+
+  const onSelectionChange = useCallback(
+    ({ nodes }: OnSelectionChangeParams<FlowNode, Edge>) => {
+      setSelectedNodeId(nodes.length > 0 ? nodes[0].id : null);
+    },
+    [setSelectedNodeId]
+  );
+
+  const onNodeClick = useCallback(
+    (_event: MouseEvent, node: FlowNode) => {
+      setSelectedNodeId(node.id);
+    },
+    [setSelectedNodeId]
+  );
+
+  const onPaneClick = useCallback(() => {
+    setSelectedNodeId(null);
+  }, [setSelectedNodeId]);
 
   const isValidConnection = useCallback<IsValidConnection<Edge>>((edgeOrConnection) => {
     const latestGraph = useNetFlowStore.getState().graph;
@@ -341,9 +371,11 @@ function FlowCanvasInner() {
         x: Number.isFinite(rawPosition.x) ? rawPosition.x : 120,
         y: Number.isFinite(rawPosition.y) ? rawPosition.y : 120,
       };
-      addNode(createWorkflowNode(payload, position));
+      const created = createWorkflowNode(payload, position);
+      addNode(created);
+      setSelectedNodeId(created.id);
     },
-    [addNode, screenToFlowPosition]
+    [addNode, screenToFlowPosition, setSelectedNodeId]
   );
 
   const onEdgeContextMenu = useCallback(
@@ -364,7 +396,7 @@ function FlowCanvasInner() {
       data-testid="flow-canvas-dropzone"
       onDragOver={onDragOver}
       onDrop={onDrop}
-      className="relative h-full w-full bg-slate-950"
+      className="relative h-full w-full bg-[#0B0D10]"
     >
       <ReactFlow<FlowNode, Edge>
         nodes={rfNodes}
@@ -373,6 +405,9 @@ function FlowCanvasInner() {
         edgeTypes={edgeTypes}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
+        onSelectionChange={onSelectionChange}
+        onNodeClick={onNodeClick}
+        onPaneClick={onPaneClick}
         onEdgeContextMenu={onEdgeContextMenu}
         onConnect={onConnect}
         isValidConnection={isValidConnection}
@@ -380,40 +415,40 @@ function FlowCanvasInner() {
         colorMode="dark"
         fitView
         fitViewOptions={{ padding: 0.25 }}
-        className="bg-slate-950"
+        className="bg-[#0B0D10]"
       >
         <Background
           variant={BackgroundVariant.Dots}
-          gap={20}
-          size={1.25}
-          color="#334155"
+          gap={22}
+          size={1}
+          color="#222730"
         />
-        <Controls className="!border-slate-700 !bg-slate-900 !shadow-lg" />
+        <Controls />
         <MiniMap
           pannable
           zoomable
           nodeColor={(node) => {
-            if (node.type === "interface") return "#38bdf8";
-            if (node.type === "vpn") return "#a78bfa";
-            if (node.type === "apps") return "#34d399";
-            return "#64748b";
+            if (node.type === "interface") return "#9CA3AF";
+            if (node.type === "vpn") return "#14B8A6";
+            if (node.type === "apps") return "#3ECF8E";
+            return "#4B5563";
           }}
-          maskColor="rgba(2, 6, 23, 0.72)"
-          className="!border !border-slate-800 !bg-slate-900/90"
+          maskColor="rgba(11, 13, 16, 0.78)"
+          className="!border !border-[#232830] !bg-[#111418]"
         />
       </ReactFlow>
 
       {graph.nodes.length === 0 && (
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center p-6">
-          <div className="max-w-md rounded-xl border border-dashed border-slate-800 bg-slate-900/75 px-6 py-5 text-center shadow-lg backdrop-blur">
-            <h3 className="text-sm font-semibold text-slate-200">
-              Build a Routing Workflow
+          <div className="max-w-sm rounded-lg border border-dashed border-[#232830] bg-[#111418]/90 px-6 py-5 text-center">
+            <h3 className="text-sm font-medium text-[#F3F4F6]">
+              Empty Routing Canvas
             </h3>
-            <p className="mt-1.5 text-xs leading-relaxed text-slate-400">
-              Drag an <span className="text-sky-300">Interface</span>,{" "}
-              <span className="text-violet-300">VPN</span>, or{" "}
-              <span className="text-emerald-300">Connected Apps</span> card from the left
-              sidebar onto the canvas, then connect handles left-to-right.
+            <p className="mt-1.5 text-xs leading-relaxed text-[#6B7280]">
+              Drag or add a <span className="text-[#9CA3AF]">Network Interface</span>,{" "}
+              <span className="text-[#14B8A6]">VPN Connection</span>, or{" "}
+              <span className="text-[#3ECF8E]">Connected Apps</span> group from the left
+              sidebar, then connect handles left to right.
             </p>
           </div>
         </div>

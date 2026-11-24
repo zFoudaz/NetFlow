@@ -135,6 +135,8 @@ export interface NetFlowStoreState {
   recoveryNotice: string | null;
   uiError: string | null;
   isApplying: boolean;
+  selectedNodeId: string | null;
+  fitViewRequestCount: number;
 
   refreshDiscovery: () => Promise<void>;
   loadWorkflows: () => Promise<void>;
@@ -163,6 +165,8 @@ export interface NetFlowStoreState {
 
   setLiveConnections: (connections: LiveConnection[]) => void;
   toggleTrafficDrawer: () => void;
+  setSelectedNodeId: (nodeId: string | null) => void;
+  requestFitView: () => void;
   dismissRecoveryNotice: () => void;
   clearUiError: () => void;
   hydrateCanvasDraft: () => void;
@@ -235,6 +239,8 @@ export const useNetFlowStore = create<NetFlowStoreState>((set, get) => ({
   recoveryNotice: null,
   uiError: null,
   isApplying: false,
+  selectedNodeId: null,
+  fitViewRequestCount: 0,
 
   refreshDiscovery: async () => {
     try {
@@ -300,6 +306,7 @@ export const useNetFlowStore = create<NetFlowStoreState>((set, get) => ({
       isDirty: false,
       validationErrors: [],
       uiError: null,
+      selectedNodeId: null,
     });
     return { switched: true, needsConfirm: false };
   },
@@ -316,6 +323,7 @@ export const useNetFlowStore = create<NetFlowStoreState>((set, get) => ({
       isDirty: false,
       validationErrors: [],
       uiError: null,
+      selectedNodeId: null,
     });
     return { switched: true, needsConfirm: false };
   },
@@ -342,6 +350,7 @@ export const useNetFlowStore = create<NetFlowStoreState>((set, get) => ({
         isDirty: false,
         validationErrors: [],
         uiError: null,
+        selectedNodeId: null,
       }));
       return saved;
     } catch (err) {
@@ -472,6 +481,7 @@ export const useNetFlowStore = create<NetFlowStoreState>((set, get) => ({
             isDirty: false,
             validationErrors: [],
             uiError: null,
+            selectedNodeId: null,
           });
         } else {
           set({
@@ -482,6 +492,7 @@ export const useNetFlowStore = create<NetFlowStoreState>((set, get) => ({
             isDirty: false,
             validationErrors: [],
             uiError: null,
+            selectedNodeId: null,
           });
         }
       } else {
@@ -579,6 +590,7 @@ export const useNetFlowStore = create<NetFlowStoreState>((set, get) => ({
         ),
       },
       isDirty: true,
+      selectedNodeId: state.selectedNodeId === nodeId ? null : state.selectedNodeId,
     }));
   },
 
@@ -650,6 +662,14 @@ export const useNetFlowStore = create<NetFlowStoreState>((set, get) => ({
     set((state) => ({ isTrafficDrawerOpen: !state.isTrafficDrawerOpen }));
   },
 
+  setSelectedNodeId: (nodeId) => {
+    set({ selectedNodeId: nodeId });
+  },
+
+  requestFitView: () => {
+    set((state) => ({ fitViewRequestCount: state.fitViewRequestCount + 1 }));
+  },
+
   dismissRecoveryNotice: () => {
     set({ recoveryNotice: null });
   },
@@ -716,6 +736,8 @@ export const useNetFlowStore = create<NetFlowStoreState>((set, get) => ({
       recoveryNotice: null,
       uiError: null,
       isApplying: false,
+      selectedNodeId: null,
+      fitViewRequestCount: 0,
     });
   },
 }));

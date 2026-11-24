@@ -142,7 +142,7 @@ export function AddAppModal({
 
   const modalContent = (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/75 p-4 backdrop-blur-sm"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-[#0B0D10]/80 p-4 backdrop-blur-xs"
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) {
           handleClose();
@@ -159,12 +159,12 @@ export function AddAppModal({
         role="dialog"
         aria-modal="true"
         aria-label="Add Application"
-        className="flex max-h-[85vh] w-full max-w-lg flex-col overflow-hidden rounded-xl border border-slate-700 bg-slate-900 text-slate-100 shadow-2xl shadow-black/70"
+        className="flex max-h-[85vh] w-full max-w-lg flex-col overflow-hidden rounded-lg border border-[#2E3540] bg-[#111418] text-[#F3F4F6] shadow-xl shadow-black/60"
       >
-        <div className="flex items-center justify-between border-b border-slate-800 px-4 py-3">
+        <div className="flex items-center justify-between border-b border-[#232830] px-4 py-3">
           <div>
-            <h2 className="text-sm font-semibold text-slate-100">Add Application</h2>
-            <p className="text-xs text-slate-400">
+            <h2 className="text-sm font-semibold text-[#F3F4F6]">Add Application</h2>
+            <p className="text-xs text-[#9CA3AF]">
               Select a running process, browse for an .exe, or type a filename.
             </p>
           </div>
@@ -172,16 +172,16 @@ export function AddAppModal({
             type="button"
             aria-label="Close modal"
             onClick={handleClose}
-            className="rounded-md p-1 text-slate-400 transition hover:bg-slate-800 hover:text-slate-100"
+            className="rounded p-1 text-[#9CA3AF] transition hover:bg-[#1D222B] hover:text-[#F3F4F6]"
           >
             <X className="h-4 w-4" />
           </button>
         </div>
 
-        <div className="space-y-3 border-b border-slate-800 px-4 py-3">
+        <div className="space-y-3 border-b border-[#232830] px-4 py-3">
           <div className="flex items-center gap-2">
             <div className="relative flex-1">
-              <Search className="pointer-events-none absolute left-2.5 top-2.5 h-4 w-4 text-slate-500" />
+              <Search className="pointer-events-none absolute left-2.5 top-2.5 h-4 w-4 text-[#6B7280]" />
               <input
                 type="text"
                 autoFocus
@@ -189,16 +189,16 @@ export function AddAppModal({
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 placeholder="Search running processes..."
-                className="w-full rounded-md border border-slate-700 bg-slate-950 py-2 pl-8 pr-3 text-xs text-slate-100 placeholder-slate-500 outline-none focus:border-sky-500"
+                className="w-full rounded-md border border-[#232830] bg-[#0B0D10] py-2 pl-8 pr-3 text-xs text-[#F3F4F6] placeholder-[#6B7280] outline-none focus:border-[#3ECF8E]"
               />
             </div>
 
             <button
               type="button"
               onClick={() => void handleBrowseExe()}
-              className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-slate-700 bg-slate-800 px-3 py-2 text-xs font-medium text-slate-200 transition hover:border-slate-600 hover:bg-slate-700"
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-[#232830] bg-[#161A20] px-3 py-2 text-xs font-medium text-[#F3F4F6] transition hover:border-[#2E3540] hover:bg-[#1D222B]"
             >
-              <FolderOpen className="h-3.5 w-3.5 text-sky-400" />
+              <FolderOpen className="h-3.5 w-3.5 text-[#3ECF8E]" />
               <span>Browse .exe...</span>
             </button>
           </div>
@@ -210,11 +210,11 @@ export function AddAppModal({
               value={manualInput}
               onChange={(e) => setManualInput(e.target.value)}
               placeholder="Or type exe name (e.g. chrome.exe)"
-              className="flex-1 rounded-md border border-slate-700 bg-slate-950 px-3 py-1.5 text-xs text-slate-100 placeholder-slate-500 outline-none focus:border-sky-500"
+              className="flex-1 rounded-md border border-[#232830] bg-[#0B0D10] px-3 py-1.5 text-xs text-[#F3F4F6] placeholder-[#6B7280] outline-none focus:border-[#3ECF8E]"
             />
             <button
               type="submit"
-              className="inline-flex items-center gap-1 rounded-md bg-sky-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-sky-500"
+              className="inline-flex items-center gap-1 rounded-md bg-[#3ECF8E] px-3 py-1.5 text-xs font-semibold text-[#0B0D10] transition hover:bg-[#34B87E]"
             >
               <Plus className="h-3.5 w-3.5" />
               <span>Add</span>
@@ -229,16 +229,16 @@ export function AddAppModal({
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2">
-          <div className="px-2 pb-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+          <div className="px-2 pb-1.5 text-[11px] font-medium uppercase tracking-wider text-[#6B7280]">
             Running Processes ({filteredProcesses.length})
           </div>
 
           {filteredProcesses.length === 0 ? (
-            <div className="px-2 py-6 text-center text-xs text-slate-500">
+            <div className="px-2 py-6 text-center text-xs text-[#6B7280]">
               No matching running processes found.
             </div>
           ) : (
-            <div className="space-y-1">
+            <div className="divide-y divide-[#1A1F26]">
               {filteredProcesses.map((proc) => {
                 const alreadyAdded = existingSet.has(proc.normalized);
                 return (
@@ -247,21 +247,21 @@ export function AddAppModal({
                     type="button"
                     disabled={alreadyAdded}
                     onClick={() => commitExe(proc.normalized)}
-                    className="flex w-full items-center justify-between gap-3 rounded-md px-2.5 py-2 text-left transition hover:bg-slate-800/80 disabled:cursor-not-allowed disabled:opacity-50"
+                    className="flex w-full items-center justify-between gap-3 px-2.5 py-2 text-left transition hover:bg-[#161A20] disabled:cursor-not-allowed disabled:opacity-45"
                   >
                     <div className="min-w-0 flex-1">
-                      <div className="font-mono text-xs font-medium text-slate-100">
+                      <div className="font-mono text-xs font-medium text-[#F3F4F6]">
                         {proc.normalized}
                       </div>
                       {proc.path && (
-                        <div className="truncate text-[11px] text-slate-500">{proc.path}</div>
+                        <div className="truncate text-[11px] text-[#6B7280]">{proc.path}</div>
                       )}
                     </div>
                     <span
                       className={`shrink-0 rounded px-2 py-0.5 text-[11px] font-medium ${
                         alreadyAdded
-                          ? "bg-slate-800 text-slate-400"
-                          : "bg-sky-500/15 text-sky-300"
+                          ? "bg-[#161A20] text-[#6B7280]"
+                          : "bg-[#3ECF8E]/10 text-[#3ECF8E]"
                       }`}
                     >
                       {alreadyAdded ? "Added" : "Select"}

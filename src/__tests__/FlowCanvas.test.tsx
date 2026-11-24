@@ -29,6 +29,7 @@ vi.mock("@tauri-apps/plugin-dialog", () => mockDialog);
 
 import { normalizeExeBasename } from "../components/AddAppModal";
 import { FlowCanvas, isValidWorkflowConnection } from "../components/FlowCanvas";
+import { PropertiesPanel } from "../components/PropertiesPanel";
 import { Sidebar } from "../components/Sidebar";
 import { useNetFlowStore } from "../store/useNetFlowStore";
 
@@ -342,17 +343,24 @@ describe("FlowCanvas, Sidebar, and Custom Nodes", () => {
       },
     });
 
-    render(<FlowCanvas />);
+    render(
+      <>
+        <FlowCanvas />
+        <PropertiesPanel />
+      </>
+    );
 
     const karingNode = await screen.findByTestId("flow-node-vpn-karing");
     expect(within(karingNode).getByText("Karing")).toBeTruthy();
     expect(within(karingNode).getByText("Running")).toBeTruthy();
+    expect(within(karingNode).getByText("via Wi-Fi")).toBeTruthy();
 
-    // Open VPN settings popover and configure Karing port override
+    // Select Karing node via settings button to inspect and configure in PropertiesPanel
     await user.click(
       within(karingNode).getByRole("button", { name: /Configure Karing settings/i })
     );
-    const portInput = await within(karingNode).findByPlaceholderText(/Detected \(3080\)/i);
+    const inspector = screen.getByLabelText("Node Properties");
+    const portInput = await within(inspector).findByPlaceholderText(/Detected \(3080\)/i);
     await user.type(portInput, "7890");
 
     const storeKaringAfterPort = useNetFlowStore
@@ -364,8 +372,8 @@ describe("FlowCanvas, Sidebar, and Custom Nodes", () => {
       settings: { karingPortOverride: 7890 },
     });
 
-    // Toggle "Set as Default" on Karing node (clears default from iface-wifi)
-    await user.click(within(karingNode).getByRole("button", { name: /Set as Default/i }));
+    // Toggle "Set as Default" in PropertiesPanel (clears default from iface-wifi)
+    await user.click(within(inspector).getByRole("button", { name: /Set as Default/i }));
 
     const nodes = useNetFlowStore.getState().graph.nodes;
     const wifiAfter = nodes.find((n) => n.id === "iface-wifi");
@@ -373,7 +381,7 @@ describe("FlowCanvas, Sidebar, and Custom Nodes", () => {
     expect(karingAfter?.kind).toMatchObject({ isDefault: true });
     expect(wifiAfter?.kind).toMatchObject({ isDefault: false });
     expect(
-      within(karingNode).getByRole("button", { name: /^DEFAULT$/i }).getAttribute("aria-pressed")
+      within(inspector).getByRole("button", { name: /^DEFAULT$/i }).getAttribute("aria-pressed")
     ).toBe("true");
   });
 
@@ -651,12 +659,18 @@ describe("FlowCanvas, Sidebar, and Custom Nodes", () => {
       },
     });
 
-    render(<FlowCanvas />);
+    render(
+      <>
+        <FlowCanvas />
+        <PropertiesPanel />
+      </>
+    );
 
-    // Karing port override
+    // Karing port override via PropertiesPanel
     const karingNode = await screen.findByTestId("flow-node-vpn-karing");
     await user.click(within(karingNode).getByRole("button", { name: /Configure Karing settings/i }));
-    const portInput = within(karingNode).getByPlaceholderText(/Detected \(3080\)/i);
+    const inspector1 = screen.getByLabelText("Node Properties");
+    const portInput = within(inspector1).getByPlaceholderText(/Detected \(3080\)/i);
     await user.type(portInput, "7890");
     expect(
       useNetFlowStore.getState().graph.nodes.find((n) => n.id === "vpn-karing")?.kind
@@ -664,11 +678,12 @@ describe("FlowCanvas, Sidebar, and Custom Nodes", () => {
       settings: { karingPortOverride: 7890 },
     });
 
-    // OpenVPN adapter & server IP overrides
+    // OpenVPN adapter & server IP overrides via PropertiesPanel
     const ovpnNode = await screen.findByTestId("flow-node-vpn-ovpn");
     await user.click(within(ovpnNode).getByRole("button", { name: /Configure OpenVPN settings/i }));
-    await user.type(within(ovpnNode).getByLabelText(/Adapter Alias Override/i), "Tun0");
-    await user.type(within(ovpnNode).getByLabelText(/Remote Server IP Override/i), "1.2.3.4");
+    const inspector2 = screen.getByLabelText("Node Properties");
+    await user.type(within(inspector2).getByLabelText(/Adapter Alias Override/i), "Tun0");
+    await user.type(within(inspector2).getByLabelText(/Remote Server IP Override/i), "1.2.3.4");
     expect(
       useNetFlowStore.getState().graph.nodes.find((n) => n.id === "vpn-ovpn")?.kind
     ).toMatchObject({

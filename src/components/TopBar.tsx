@@ -3,9 +3,12 @@ import {
   Activity,
   AlertTriangle,
   Check,
+  CheckCircle2,
   ChevronDown,
   CopyPlus,
   FilePlus2,
+  Folder,
+  Maximize2,
   Pencil,
   Play,
   RefreshCw,
@@ -35,27 +38,27 @@ const STATUS_META: Record<
 > = {
   stopped: {
     label: "Stopped",
-    pillClass: "border-slate-700 bg-slate-800/80 text-slate-300",
-    dotClass: "bg-slate-400",
+    pillClass: "border-[#232830] bg-[#161A20] text-[#9CA3AF]",
+    dotClass: "bg-[#6B7280]",
   },
   applying: {
     label: "Applying",
-    pillClass: "border-sky-500/40 bg-sky-500/15 text-sky-300",
-    dotClass: "bg-sky-400 animate-pulse",
+    pillClass: "border-teal-500/40 bg-teal-500/10 text-teal-300",
+    dotClass: "bg-teal-400 animate-pulse",
   },
   active: {
     label: "Active",
-    pillClass: "border-emerald-500/40 bg-emerald-500/15 text-emerald-300",
-    dotClass: "bg-emerald-400",
+    pillClass: "border-[#3ECF8E]/40 bg-[#3ECF8E]/10 text-[#3ECF8E]",
+    dotClass: "bg-[#3ECF8E]",
   },
   warning: {
     label: "Warning",
-    pillClass: "border-amber-500/40 bg-amber-500/15 text-amber-300",
+    pillClass: "border-amber-500/40 bg-amber-500/10 text-amber-300",
     dotClass: "bg-amber-400 animate-pulse",
   },
   error: {
     label: "Error",
-    pillClass: "border-rose-500/40 bg-rose-500/15 text-rose-300",
+    pillClass: "border-rose-500/40 bg-rose-500/10 text-rose-300",
     dotClass: "bg-rose-400",
   },
 };
@@ -81,6 +84,8 @@ export function TopBar() {
   const applyCurrentWorkflow = useNetFlowStore((s) => s.applyCurrentWorkflow);
   const switchAndApplyWorkflow = useNetFlowStore((s) => s.switchAndApplyWorkflow);
   const stopRouting = useNetFlowStore((s) => s.stopRouting);
+  const validateCurrentGraph = useNetFlowStore((s) => s.validateCurrentGraph);
+  const requestFitView = useNetFlowStore((s) => s.requestFitView);
   const toggleTrafficDrawer = useNetFlowStore((s) => s.toggleTrafficDrawer);
   const dismissRecoveryNotice = useNetFlowStore((s) => s.dismissRecoveryNotice);
   const clearUiError = useNetFlowStore((s) => s.clearUiError);
@@ -89,6 +94,7 @@ export function TopBar() {
   const [promptMode, setPromptMode] = useState<PromptMode>(null);
   const [nameInput, setNameInput] = useState("");
   const [pendingDiscard, setPendingDiscard] = useState<PendingDiscard>(null);
+  const [validatedOk, setValidatedOk] = useState(false);
 
   const routingActive = isRoutingActiveState(engineStatus.state);
   const statusMeta = STATUS_META[engineStatus.state];
@@ -171,47 +177,47 @@ export function TopBar() {
     setMenuOpen(false);
   };
 
-  return (
-    <header className="relative z-30 flex flex-col border-b border-slate-800 bg-slate-900/95 text-slate-100 backdrop-blur">
-      <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-2.5">
-        {/* Left: Brand + Workflow Switcher */}
-        <div className="flex items-center gap-3">
-          <div className="flex items-center gap-2 pr-2">
-            <span className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-sky-500/20 text-xs font-bold tracking-wider text-sky-300 ring-1 ring-sky-500/40">
-              NF
-            </span>
-            <span className="text-sm font-semibold tracking-tight text-slate-100">
-              NetFlow
-            </span>
-          </div>
+  const handleValidate = async () => {
+    const ok = await validateCurrentGraph();
+    if (ok) {
+      setValidatedOk(true);
+      setTimeout(() => setValidatedOk(false), 2000);
+    }
+  };
 
+  return (
+    <header className="relative z-30 flex flex-col border-b border-[#232830] bg-[#111418] text-[#F3F4F6]">
+      <div className="flex h-12 flex-wrap items-center justify-between gap-2 px-4">
+        {/* Left: Workflow Switcher + Canvas Utilities */}
+        <div className="flex items-center gap-2">
           <div className="relative">
             <button
               type="button"
               onClick={() => setMenuOpen((prev) => !prev)}
               aria-expanded={menuOpen}
               aria-label="Workflow Switcher"
-              className="inline-flex items-center gap-2 rounded-md border border-slate-700 bg-slate-800 px-3 py-1.5 text-sm font-medium text-slate-100 transition hover:border-slate-600 hover:bg-slate-700/80"
+              className="inline-flex h-8 items-center gap-2 rounded-md border border-[#232830] bg-[#161A20] px-2.5 text-xs font-medium text-[#F3F4F6] transition hover:border-[#2E3540] hover:bg-[#1D222B]"
             >
-              <span className="max-w-48 truncate">
+              <Folder className="h-3.5 w-3.5 text-[#9CA3AF]" />
+              <span className="max-w-44 truncate">
                 {currentWorkflowName}
                 {isDirty ? " *" : ""}
               </span>
-              <ChevronDown className="h-4 w-4 text-slate-400" />
+              <ChevronDown className="h-3.5 w-3.5 text-[#6B7280]" />
             </button>
 
             {menuOpen && (
               <div
                 role="menu"
-                className="absolute left-0 mt-1.5 w-80 rounded-lg border border-slate-700 bg-slate-900 p-1.5 shadow-xl shadow-black/50"
+                className="absolute left-0 mt-1.5 w-80 rounded-md border border-[#2E3540] bg-[#111418] p-1.5 shadow-lg shadow-black/40"
               >
-                <div className="px-2 py-1 text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                <div className="px-2 py-1 text-[11px] font-medium uppercase tracking-wider text-[#6B7280]">
                   Saved Workflows
                 </div>
 
                 <div className="max-h-56 space-y-0.5 overflow-y-auto py-1">
                   {workflows.length === 0 ? (
-                    <div className="px-2.5 py-2 text-xs text-slate-500">
+                    <div className="px-2.5 py-2 text-xs text-[#6B7280]">
                       No saved workflows yet.
                     </div>
                   ) : (
@@ -222,10 +228,10 @@ export function TopBar() {
                       return (
                         <div
                           key={wf.id}
-                          className={`flex items-center justify-between gap-2 rounded-md px-2 py-1.5 text-sm ${
+                          className={`flex items-center justify-between gap-2 rounded px-2 py-1.5 text-xs ${
                             isCurrent
-                              ? "bg-slate-800 text-slate-100"
-                              : "text-slate-300 hover:bg-slate-800/60"
+                              ? "bg-[#1D222B] text-[#F3F4F6]"
+                              : "text-[#9CA3AF] hover:bg-[#161A20] hover:text-[#F3F4F6]"
                           }`}
                         >
                           <button
@@ -233,12 +239,12 @@ export function TopBar() {
                             onClick={() => handleSelectWorkflow(wf.id, wf.name)}
                             className="flex min-w-0 flex-1 items-center gap-2 text-left"
                           >
-                            <span className="truncate">
+                            <span className="truncate font-medium">
                               {wf.name}
                               {isCurrent && isDirty ? " *" : ""}
                             </span>
                             {isRunningWf && (
-                              <span className="shrink-0 rounded bg-emerald-500/20 px-1.5 py-0.5 text-[10px] font-medium text-emerald-300">
+                              <span className="shrink-0 rounded border border-[#3ECF8E]/30 bg-[#3ECF8E]/10 px-1.5 py-0.5 text-[10px] font-medium text-[#3ECF8E]">
                                 Running
                               </span>
                             )}
@@ -248,7 +254,7 @@ export function TopBar() {
                             <button
                               type="button"
                               onClick={() => void handleSwitchAndApply(wf.id, wf.name)}
-                              className="shrink-0 rounded border border-sky-500/40 bg-sky-500/15 px-2 py-0.5 text-xs font-medium text-sky-300 transition hover:bg-sky-500/25"
+                              className="shrink-0 rounded border border-[#3ECF8E]/40 bg-[#3ECF8E]/10 px-2 py-0.5 text-[11px] font-medium text-[#3ECF8E] transition hover:bg-[#3ECF8E]/20"
                             >
                               Switch &amp; Apply
                             </button>
@@ -259,15 +265,15 @@ export function TopBar() {
                   )}
                 </div>
 
-                <div className="my-1.5 border-t border-slate-800" />
+                <div className="my-1.5 border-t border-[#232830]" />
 
                 <div className="grid grid-cols-2 gap-1 p-0.5">
                   <button
                     type="button"
                     onClick={handleRequestNew}
-                    className="inline-flex items-center gap-1.5 rounded px-2.5 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-800"
+                    className="inline-flex items-center gap-1.5 rounded px-2.5 py-1.5 text-xs font-medium text-[#F3F4F6] hover:bg-[#1D222B]"
                   >
-                    <FilePlus2 className="h-3.5 w-3.5 text-slate-400" />
+                    <FilePlus2 className="h-3.5 w-3.5 text-[#9CA3AF]" />
                     New
                   </button>
                   <button
@@ -276,9 +282,9 @@ export function TopBar() {
                       void saveCurrentWorkflow();
                       setMenuOpen(false);
                     }}
-                    className="inline-flex items-center gap-1.5 rounded px-2.5 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-800"
+                    className="inline-flex items-center gap-1.5 rounded px-2.5 py-1.5 text-xs font-medium text-[#F3F4F6] hover:bg-[#1D222B]"
                   >
-                    <Save className="h-3.5 w-3.5 text-slate-400" />
+                    <Save className="h-3.5 w-3.5 text-[#9CA3AF]" />
                     Save
                   </button>
                   <button
@@ -286,9 +292,9 @@ export function TopBar() {
                     onClick={() =>
                       openNamePrompt({ kind: "saveAs" }, `${currentWorkflowName} Copy`)
                     }
-                    className="inline-flex items-center gap-1.5 rounded px-2.5 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-800"
+                    className="inline-flex items-center gap-1.5 rounded px-2.5 py-1.5 text-xs font-medium text-[#F3F4F6] hover:bg-[#1D222B]"
                   >
-                    <CopyPlus className="h-3.5 w-3.5 text-slate-400" />
+                    <CopyPlus className="h-3.5 w-3.5 text-[#9CA3AF]" />
                     Save As
                   </button>
                   <button
@@ -301,16 +307,16 @@ export function TopBar() {
                         currentWorkflowName
                       )
                     }
-                    className="inline-flex items-center gap-1.5 rounded px-2.5 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+                    className="inline-flex items-center gap-1.5 rounded px-2.5 py-1.5 text-xs font-medium text-[#F3F4F6] hover:bg-[#1D222B] disabled:cursor-not-allowed disabled:opacity-40"
                   >
-                    <Pencil className="h-3.5 w-3.5 text-slate-400" />
+                    <Pencil className="h-3.5 w-3.5 text-[#9CA3AF]" />
                     Rename
                   </button>
                   <button
                     type="button"
                     disabled={!currentWorkflowId}
                     onClick={() => void handleDeleteCurrent()}
-                    className="col-span-2 inline-flex items-center gap-1.5 rounded px-2.5 py-1.5 text-xs font-medium text-rose-300 hover:bg-rose-500/15 disabled:cursor-not-allowed disabled:opacity-40"
+                    className="col-span-2 inline-flex items-center gap-1.5 rounded px-2.5 py-1.5 text-xs font-medium text-rose-400 hover:bg-rose-500/10 disabled:cursor-not-allowed disabled:opacity-40"
                   >
                     <Trash2 className="h-3.5 w-3.5" />
                     Delete Workflow
@@ -319,32 +325,65 @@ export function TopBar() {
               </div>
             )}
           </div>
+
+          <div className="h-4 w-px bg-[#232830]" />
+
+          <button
+            type="button"
+            onClick={requestFitView}
+            className="inline-flex h-8 items-center gap-1.5 rounded-md border border-[#232830] bg-[#161A20] px-2.5 text-xs font-medium text-[#9CA3AF] transition hover:border-[#2E3540] hover:bg-[#1D222B] hover:text-[#F3F4F6]"
+          >
+            <Maximize2 className="h-3.5 w-3.5" />
+            <span>Fit View</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => void handleValidate()}
+            className={`inline-flex h-8 items-center gap-1.5 rounded-md border px-2.5 text-xs font-medium transition ${
+              validatedOk
+                ? "border-[#3ECF8E]/40 bg-[#3ECF8E]/10 text-[#3ECF8E]"
+                : "border-[#232830] bg-[#161A20] text-[#9CA3AF] hover:border-[#2E3540] hover:bg-[#1D222B] hover:text-[#F3F4F6]"
+            }`}
+          >
+            <CheckCircle2 className={`h-3.5 w-3.5 ${validatedOk ? "text-[#3ECF8E]" : "text-[#3ECF8E]"}`} />
+            <span>{validatedOk ? "Valid" : "Validate"}</span>
+          </button>
         </div>
 
-        {/* Center/Right: Status Pill, Engine Controls, Traffic Toggle */}
-        <div className="flex flex-wrap items-center gap-2.5">
+        {/* Right: Status Pill, Live Traffic, Start/Apply, Stop */}
+        <div className="flex flex-wrap items-center gap-2">
           <div
-            className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-medium ${statusMeta.pillClass}`}
+            className={`inline-flex h-7 items-center gap-1.5 rounded-md border px-2.5 text-[11px] font-medium ${statusMeta.pillClass}`}
           >
-            <span className={`h-2 w-2 rounded-full ${statusMeta.dotClass}`} />
+            <span className={`h-1.5 w-1.5 rounded-full ${statusMeta.dotClass}`} />
             <span>{statusMeta.label}</span>
           </div>
 
           <button
             type="button"
-            disabled={applyingNow}
-            onClick={() => void applyCurrentWorkflow()}
-            className="inline-flex items-center gap-1.5 rounded-md bg-sky-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-sky-500 disabled:cursor-not-allowed disabled:opacity-50"
+            onClick={toggleTrafficDrawer}
+            aria-pressed={isTrafficDrawerOpen}
+            className={`inline-flex h-8 items-center gap-1.5 rounded-md border px-2.5 text-xs font-medium transition ${
+              isTrafficDrawerOpen
+                ? "border-[#14B8A6]/50 bg-[#14B8A6]/10 text-[#2DD4BF]"
+                : "border-[#232830] bg-[#161A20] text-[#9CA3AF] hover:border-[#2E3540] hover:bg-[#1D222B] hover:text-[#F3F4F6]"
+            }`}
           >
-            <Play className="h-3.5 w-3.5" />
-            <span>{applyingNow ? "Applying..." : "Start / Apply"}</span>
+            <Activity className="h-3.5 w-3.5" />
+            <span>Live Traffic</span>
+            {liveConnections.length > 0 && (
+              <span className="rounded bg-[#232830] px-1.5 py-0.5 font-mono text-[10px] text-[#F3F4F6]">
+                {liveConnections.length}
+              </span>
+            )}
           </button>
 
           <button
             type="button"
             disabled={engineStatus.state === "stopped"}
             onClick={() => void stopRouting()}
-            className="inline-flex items-center gap-1.5 rounded-md border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-semibold text-slate-200 transition hover:border-rose-500/50 hover:bg-rose-500/15 hover:text-rose-200 disabled:cursor-not-allowed disabled:opacity-40"
+            className="inline-flex h-8 items-center gap-1.5 rounded-md border border-[#232830] bg-[#161A20] px-2.5 text-xs font-medium text-[#9CA3AF] transition hover:border-rose-500/40 hover:bg-rose-500/10 hover:text-rose-300 disabled:cursor-not-allowed disabled:opacity-40"
           >
             <Square className="h-3.5 w-3.5" />
             <span>Stop</span>
@@ -352,21 +391,12 @@ export function TopBar() {
 
           <button
             type="button"
-            onClick={toggleTrafficDrawer}
-            aria-pressed={isTrafficDrawerOpen}
-            className={`inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium transition ${
-              isTrafficDrawerOpen
-                ? "border-sky-500/50 bg-sky-500/15 text-sky-200"
-                : "border-slate-700 bg-slate-800 text-slate-300 hover:bg-slate-700"
-            }`}
+            disabled={applyingNow}
+            onClick={() => void applyCurrentWorkflow()}
+            className="inline-flex h-8 items-center gap-1.5 rounded-md bg-[#3ECF8E] px-3.5 text-xs font-semibold text-[#0B0D10] transition hover:bg-[#34B87E] disabled:cursor-not-allowed disabled:opacity-50"
           >
-            <Activity className="h-3.5 w-3.5" />
-            <span>Live Traffic</span>
-            {liveConnections.length > 0 && (
-              <span className="rounded bg-slate-700/90 px-1.5 py-0.5 text-[10px] font-semibold text-slate-200">
-                {liveConnections.length}
-              </span>
-            )}
+            <Play className="h-3.5 w-3.5 fill-current" />
+            <span>{applyingNow ? "Applying..." : "Start / Apply"}</span>
           </button>
         </div>
       </div>
@@ -375,9 +405,9 @@ export function TopBar() {
       {promptMode && (
         <form
           onSubmit={(e) => void handlePromptSubmit(e)}
-          className="flex items-center gap-2 border-t border-slate-800 bg-slate-950/70 px-4 py-2 text-xs"
+          className="flex items-center gap-2 border-t border-[#232830] bg-[#0B0D10] px-4 py-2 text-xs"
         >
-          <span className="font-medium text-slate-300">
+          <span className="font-medium text-[#9CA3AF]">
             {promptMode.kind === "new"
               ? "New workflow name:"
               : promptMode.kind === "saveAs"
@@ -390,11 +420,11 @@ export function TopBar() {
             value={nameInput}
             onChange={(e) => setNameInput(e.target.value)}
             placeholder="Workflow name"
-            className="w-64 rounded border border-slate-700 bg-slate-900 px-2.5 py-1 text-xs text-slate-100 outline-none focus:border-sky-500"
+            className="w-64 rounded border border-[#232830] bg-[#161A20] px-2.5 py-1 text-xs text-[#F3F4F6] outline-none focus:border-[#3ECF8E]"
           />
           <button
             type="submit"
-            className="inline-flex items-center gap-1 rounded bg-sky-600 px-2.5 py-1 font-medium text-white hover:bg-sky-500"
+            className="inline-flex items-center gap-1 rounded bg-[#3ECF8E] px-2.5 py-1 font-semibold text-[#0B0D10] hover:bg-[#34B87E]"
           >
             <Check className="h-3.5 w-3.5" />
             Confirm
@@ -402,7 +432,7 @@ export function TopBar() {
           <button
             type="button"
             onClick={() => setPromptMode(null)}
-            className="inline-flex items-center gap-1 rounded border border-slate-700 px-2.5 py-1 text-slate-300 hover:bg-slate-800"
+            className="inline-flex items-center gap-1 rounded border border-[#232830] bg-[#161A20] px-2.5 py-1 text-[#9CA3AF] hover:bg-[#1D222B] hover:text-[#F3F4F6]"
           >
             Cancel
           </button>
@@ -426,14 +456,14 @@ export function TopBar() {
             <button
               type="button"
               onClick={() => void handleConfirmDiscard()}
-              className="rounded bg-amber-500 px-2.5 py-1 font-semibold text-slate-950 hover:bg-amber-400"
+              className="rounded bg-amber-500 px-2.5 py-1 font-semibold text-[#0B0D10] hover:bg-amber-400"
             >
               {pendingDiscard.kind === "new" ? "Discard & Continue" : "Discard & Switch"}
             </button>
             <button
               type="button"
               onClick={() => setPendingDiscard(null)}
-              className="rounded border border-amber-500/40 px-2.5 py-1 text-amber-200 hover:bg-amber-500/20"
+              className="rounded border border-amber-500/40 px-2.5 py-1 text-amber-200 hover:bg-amber-500/15"
             >
               Keep Editing
             </button>
@@ -454,7 +484,7 @@ export function TopBar() {
           <button
             type="button"
             onClick={() => void applyCurrentWorkflow()}
-            className="inline-flex items-center gap-1 rounded bg-amber-500 px-2.5 py-1 font-semibold text-slate-950 transition hover:bg-amber-400"
+            className="inline-flex items-center gap-1 rounded bg-amber-500 px-2.5 py-1 font-semibold text-[#0B0D10] transition hover:bg-amber-400"
           >
             <RefreshCw className="h-3 w-3" />
             Re-Apply
@@ -464,16 +494,16 @@ export function TopBar() {
 
       {/* Startup Crash-Recovery Notice */}
       {recoveryNotice && (
-        <div className="flex items-center justify-between gap-2 border-t border-sky-500/30 bg-sky-500/10 px-4 py-2 text-xs text-sky-200">
+        <div className="flex items-center justify-between gap-2 border-t border-teal-500/30 bg-teal-500/10 px-4 py-2 text-xs text-teal-200">
           <div className="flex items-center gap-2">
-            <ShieldAlert className="h-4 w-4 shrink-0 text-sky-400" />
+            <ShieldAlert className="h-4 w-4 shrink-0 text-teal-400" />
             <span>{recoveryNotice}</span>
           </div>
           <button
             type="button"
             aria-label="Dismiss recovery notice"
             onClick={dismissRecoveryNotice}
-            className="rounded p-0.5 text-sky-300 hover:bg-sky-500/20"
+            className="rounded p-0.5 text-teal-300 hover:bg-teal-500/20"
           >
             <X className="h-3.5 w-3.5" />
           </button>

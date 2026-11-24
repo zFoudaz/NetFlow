@@ -1,9 +1,9 @@
 import { Handle, Position, type Node, type NodeProps } from "@xyflow/react";
-import { Network, Trash2 } from "lucide-react";
+import { Trash2 } from "lucide-react";
 import { useNetFlowStore } from "../../store/useNetFlowStore";
 import type { WorkflowNode } from "../../types/workflow";
 import {
-  DefaultTogglePill,
+  getInterfaceIcon,
   getNodeCardBorderClass,
   NodeErrorCallout,
   useNodeDiagnostics,
@@ -14,8 +14,8 @@ export type InterfaceFlowNode = Node<{ node: WorkflowNode }, "interface">;
 export function InterfaceNode({ data, selected }: NodeProps<InterfaceFlowNode>) {
   const wfNode = data.node;
   const discoveryInterfaces = useNetFlowStore((s) => s.discovery.interfaces);
+  const selectedNodeId = useNetFlowStore((s) => s.selectedNodeId);
   const removeNode = useNetFlowStore((s) => s.removeNode);
-  const setDefaultNode = useNetFlowStore((s) => s.setDefaultNode);
   const { nodeErrors, isDropped, hasIssue, errorTooltip } = useNodeDiagnostics(wfNode.id);
 
   if (wfNode.kind.type !== "interface") {
@@ -25,28 +25,51 @@ export function InterfaceNode({ data, selected }: NodeProps<InterfaceFlowNode>) 
   const { interfaceAlias, isDefault } = wfNode.kind;
   const ifaceInfo = discoveryInterfaces.find((i) => i.alias === interfaceAlias);
   const isUp = Boolean(ifaceInfo?.isUp);
+  const Icon = getInterfaceIcon(interfaceAlias);
+  const isSelected = Boolean(selected) || selectedNodeId === wfNode.id;
 
   return (
     <div
       data-testid={`flow-node-${wfNode.id}`}
       title={errorTooltip}
-      className={`w-60 rounded-xl border bg-slate-900/95 p-3 text-slate-100 shadow-lg shadow-black/40 transition ${getNodeCardBorderClass(
+      className={`group w-56 rounded-lg border bg-[#161A20] p-3 text-[#F3F4F6] transition ${getNodeCardBorderClass(
         hasIssue,
-        Boolean(selected),
+        isSelected,
         isDefault
       )}`}
     >
       <div className="flex items-start justify-between gap-2">
-        <div className="flex min-w-0 items-center gap-2">
-          <span className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-sky-500/30 bg-sky-500/15 text-sky-300">
-            <Network className="h-4 w-4" />
-          </span>
+        <div className="flex min-w-0 items-center gap-2.5">
+          <Icon
+            className={`h-4 w-4 shrink-0 ${
+              isUp ? "text-[#3ECF8E]" : "text-[#6B7280]"
+            }`}
+          />
           <div className="min-w-0">
-            <div className="text-[10px] font-semibold uppercase tracking-wider text-sky-400">
-              Interface
+            <div className="flex items-center gap-1.5">
+              <span className="truncate text-[13px] font-semibold text-[#F3F4F6]">
+                {interfaceAlias}
+              </span>
+              {isDefault && (
+                <span className="shrink-0 rounded border border-[#3ECF8E]/30 bg-[#3ECF8E]/10 px-1 py-0.2 text-[9px] font-semibold uppercase tracking-wide text-[#3ECF8E]">
+                  Default
+                </span>
+              )}
             </div>
-            <div className="truncate text-sm font-semibold text-slate-100">
-              {interfaceAlias}
+            <div className="mt-0.5 flex items-center gap-1.5 text-[11px]">
+              <span
+                className={`h-1.5 w-1.5 rounded-full ${
+                  isUp ? "bg-[#3ECF8E]" : "bg-amber-400"
+                }`}
+              />
+              <span className={isUp ? "text-[#3ECF8E]" : "text-amber-300"}>
+                {isUp ? "Up" : "Offline"}
+              </span>
+              {isDropped && (
+                <span className="ml-1 rounded bg-rose-500/20 px-1.5 py-0.2 text-[10px] font-medium text-rose-300">
+                  Dropped
+                </span>
+              )}
             </div>
           </div>
         </div>
@@ -54,46 +77,20 @@ export function InterfaceNode({ data, selected }: NodeProps<InterfaceFlowNode>) 
         <button
           type="button"
           aria-label={`Delete ${interfaceAlias} node`}
-          onClick={() => removeNode(wfNode.id)}
-          className="nodrag rounded p-1 text-slate-500 transition hover:bg-rose-500/15 hover:text-rose-300"
+          onClick={(e) => {
+            e.stopPropagation();
+            removeNode(wfNode.id);
+          }}
+          className="nodrag rounded p-1 text-[#6B7280] opacity-0 transition group-hover:opacity-100 hover:bg-rose-500/15 hover:text-rose-300 focus:opacity-100"
         >
           <Trash2 className="h-3.5 w-3.5" />
         </button>
       </div>
 
-      <div className="mt-2.5 flex flex-wrap items-center gap-1.5 text-xs">
-        {isUp ? (
-          <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/30 bg-emerald-500/15 px-2 py-0.5 text-[11px] font-medium text-emerald-300">
-            <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-            Up
-          </span>
-        ) : (
-          <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-500/40 bg-amber-500/15 px-2 py-0.5 text-[11px] font-medium text-amber-300">
-            <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
-            Offline
-          </span>
-        )}
-
-        {isDropped && (
-          <span className="inline-flex items-center rounded-full border border-rose-500/40 bg-rose-500/20 px-2 py-0.5 text-[11px] font-semibold text-rose-300">
-            Dropped
-          </span>
-        )}
-
-        <span className="ml-auto font-mono text-[11px] text-slate-400">
-          {ifaceInfo?.ipv4 ?? "No IPv4"}
-        </span>
-      </div>
-
-      <div className="mt-2.5 flex items-center justify-between border-t border-slate-800/90 pt-2">
-        <DefaultTogglePill
-          isDefault={isDefault}
-          onToggle={() => setDefaultNode(wfNode.id)}
-        />
+      <div className="mt-2.5 flex items-center justify-between border-t border-[#232830] pt-2 font-mono text-[11px] text-[#9CA3AF]">
+        <span>{ifaceInfo?.ipv4 ?? "No IPv4"}</span>
         {ifaceInfo?.gatewayIpv4 && (
-          <span className="font-mono text-[10px] text-slate-500">
-            GW {ifaceInfo.gatewayIpv4}
-          </span>
+          <span className="text-[10px] text-[#6B7280]">GW {ifaceInfo.gatewayIpv4}</span>
         )}
       </div>
 
@@ -102,7 +99,7 @@ export function InterfaceNode({ data, selected }: NodeProps<InterfaceFlowNode>) 
       <Handle
         type="source"
         position={Position.Right}
-        className="!h-3 !w-3 !border-2 !border-slate-950 !bg-sky-400"
+        className="!h-2.5 !w-2.5 !border !border-[#2E3540] !bg-[#9CA3AF]"
       />
     </div>
   );

@@ -1,7 +1,7 @@
 import {
   BaseEdge,
   EdgeLabelRenderer,
-  getSmoothStepPath,
+  getBezierPath,
   type EdgeProps,
 } from "@xyflow/react";
 import { X } from "lucide-react";
@@ -20,7 +20,7 @@ export function DeletableEdge({
   markerEnd,
   selected,
 }: EdgeProps) {
-  const [edgePath, labelX, labelY] = getSmoothStepPath({
+  const [edgePath, labelX, labelY] = getBezierPath({
     sourceX,
     sourceY,
     sourcePosition,
@@ -55,13 +55,13 @@ export function DeletableEdge({
             onClick={handleDelete}
             aria-label={`Delete connection ${id}`}
             title="Delete connection (or right-click line)"
-            className={`flex h-5 w-5 items-center justify-center rounded-full border text-xs shadow transition ${
+            className={`flex h-4 w-4 items-center justify-center rounded-full border text-[10px] transition ${
               selected
                 ? "border-rose-400 bg-rose-600 text-white opacity-100"
-                : "border-slate-600 bg-slate-900/90 text-slate-300 opacity-75 hover:border-rose-400 hover:bg-rose-600 hover:text-white hover:opacity-100"
+                : "border-[#2E3540] bg-[#111418] text-[#9CA3AF] opacity-40 hover:border-rose-400 hover:bg-rose-600 hover:text-white hover:opacity-100"
             }`}
           >
-            <X className="h-3 w-3" />
+            <X className="h-2.5 w-2.5" />
           </button>
         </div>
       </EdgeLabelRenderer>
