@@ -74,6 +74,13 @@ pub enum CompileError {
     MissingWarpAdapterAlias,
     #[error("missing SOCKS5 port for Cloudflare WARP Proxy mode")]
     MissingWarpSocksPort,
+    #[error(
+        "Cloudflare WARP in Proxy mode ('{node_id}') cannot chain downstream VPN '{downstream_node_id}'"
+    )]
+    WarpProxyCannotChainDownstream {
+        node_id: String,
+        downstream_node_id: String,
+    },
     #[error("missing virtual adapter alias for OpenVPN")]
     MissingOpenVpnAdapterAlias,
     #[error("invalid OpenVPN server IPv4 address '{value}'")]
@@ -303,6 +310,16 @@ fn build_vpn_outbounds(
                         )
                     }
                     WarpMode::Proxy => {
+                        if let Some(downstream) = validated
+                            .vpn_chains
+                            .iter()
+                            .find(|other| other.upstream_node_id == chain.node_id)
+                        {
+                            return Err(CompileError::WarpProxyCannotChainDownstream {
+                                node_id: chain.node_id.clone(),
+                                downstream_node_id: downstream.node_id.clone(),
+                            });
+                        }
                         let port = runtime
                             .warp_socks_port
                             .filter(|p| *p != 0)
@@ -1463,5 +1480,52 @@ mod tests {
         assert_eq!(compiled.outbound_to_node_id.len(), 3);
         let tags: HashSet<&String> = compiled.outbound_to_node_id.keys().collect();
         assert_eq!(tags.len(), 3);
+    }
+
+    #[test]
+    fn test_rejects_warp_proxy_runtime_override_when_chained_upstream_of_vpn() {
+        let graph = WorkflowGraph {
+            nodes: vec![
+                iface_node("if-wifi", "Wi-Fi", false),
+                vpn_node(
+                    "vpn-warp",
+                    VpnProvider::CloudflareWarp,
+                    false,
+                    WarpMode::Tun,
+                ),
+                vpn_node("vpn-ovpn", VpnProvider::OpenVpn, false, WarpMode::Tun),
+                apps_node("apps-1", &["firefox.exe"]),
+            ],
+            edges: vec![
+                edge("e1", "if-wifi", "vpn-warp"),
+                edge("e2", "vpn-warp", "vpn-ovpn"),
+                edge("e3", "vpn-ovpn", "apps-1"),
+            ],
+        };
+
+        let validated = validate_graph(&graph).expect("WARP Tun -> OpenVPN validates cleanly");
+        let mut vpn_runtime = HashMap::new();
+        vpn_runtime.insert(VpnProvider::CloudflareWarp, warp_proxy_runtime(40000));
+        vpn_runtime.insert(
+            VpnProvider::OpenVpn,
+            openvpn_runtime("OpenVPN Data Channel Offload", Some("203.0.113.10")),
+        );
+
+        let err = compile_singbox_config(&CompileInput {
+            validated,
+            default_physical_interface: "Wi-Fi".to_string(),
+            vpn_runtime,
+            clash_api_port: 9090,
+            log_path: PathBuf::from("sing-box.log"),
+        })
+        .expect_err("runtime WarpMode::Proxy with downstream VPN must fail compilation");
+
+        assert_eq!(
+            err,
+            CompileError::WarpProxyCannotChainDownstream {
+                node_id: "vpn-warp".to_string(),
+                downstream_node_id: "vpn-ovpn".to_string(),
+            }
+        );
     }
 }
