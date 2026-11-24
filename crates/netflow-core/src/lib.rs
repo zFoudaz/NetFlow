@@ -5,10 +5,12 @@
 //! reused across targets.
 
 pub mod compiler;
+pub mod discovery;
 pub mod model;
 pub mod recovery;
 pub mod storage;
 pub mod validator;
+pub mod win_net;
 
 /// Returns the semantic version of `netflow-core`.
 pub fn core_version() -> &'static str {
