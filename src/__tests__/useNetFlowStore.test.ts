@@ -20,6 +20,11 @@ const mockTauri = vi.hoisted(() => ({
   stopRouting: vi.fn(),
   getEngineStatus: vi.fn(),
   takeRecoveryNotice: vi.fn(),
+  getAppSettings: vi.fn(),
+  updateAppSettings: vi.fn(),
+  listAppGroups: vi.fn(),
+  saveAppGroup: vi.fn(),
+  deleteAppGroup: vi.fn(),
   onStatusChanged: vi.fn(),
   onTrafficUpdated: vi.fn(),
   onRecoveryNotice: vi.fn(),
@@ -27,7 +32,7 @@ const mockTauri = vi.hoisted(() => ({
 
 vi.mock("../lib/tauri", () => mockTauri);
 
-import { useNetFlowStore } from "../store/useNetFlowStore";
+import { serializeRoutingGraph, useNetFlowStore } from "../store/useNetFlowStore";
 
 const makeGraph = (overrides?: Partial<WorkflowGraph>): WorkflowGraph => ({
   nodes: [
@@ -114,6 +119,12 @@ describe("useNetFlowStore", () => {
     mockTauri.validateWorkflowGraph.mockResolvedValue(null);
     mockTauri.getEngineStatus.mockResolvedValue(stoppedStatus);
     mockTauri.takeRecoveryNotice.mockResolvedValue(null);
+    mockTauri.getAppSettings.mockResolvedValue({
+      startWithWindows: false,
+      autoApplyLastWorkflow: false,
+      lastActiveWorkflowId: null,
+    });
+    mockTauri.listAppGroups.mockResolvedValue([]);
     mockTauri.onStatusChanged.mockResolvedValue(() => {});
     mockTauri.onTrafficUpdated.mockResolvedValue(() => {});
     mockTauri.onRecoveryNotice.mockResolvedValue(() => {});
@@ -371,5 +382,141 @@ describe("useNetFlowStore", () => {
     mockTauri.renameWorkflow.mockResolvedValue({ ...savedAs, name: "Renamed Flow" });
     await useNetFlowStore.getState().renameWorkflow("wf-copy", "Renamed Flow");
     expect(useNetFlowStore.getState().currentWorkflowName).toBe("Renamed Flow");
+  });
+
+  it("test_set_default_node_auto_applies_when_active_and_ignores_xy_in_signature", async () => {
+    const twoIfacesGraph: WorkflowGraph = {
+      nodes: [
+        {
+          id: "iface-wifi",
+          x: 100,
+          y: 100,
+          kind: { type: "interface", interfaceAlias: "Wi-Fi", isDefault: true },
+        },
+        {
+          id: "iface-eth",
+          x: 100,
+          y: 260,
+          kind: { type: "interface", interfaceAlias: "Ethernet", isDefault: false },
+        },
+      ],
+      edges: [],
+    };
+    const wfTwo: SavedWorkflow = {
+      id: "wf-two",
+      name: "Dual WAN",
+      updatedAt: "2026-11-24T07:00:00Z",
+      graph: twoIfacesGraph,
+    };
+
+    // Moving a node (x/y only) must NOT change serializeRoutingGraph signature
+    const movedGraph: WorkflowGraph = {
+      ...twoIfacesGraph,
+      nodes: twoIfacesGraph.nodes.map((n) => (n.id === "iface-eth" ? { ...n, x: 420, y: 310 } : n)),
+    };
+    expect(serializeRoutingGraph(movedGraph)).toBe(serializeRoutingGraph(twoIfacesGraph));
+
+    // Changing default/apps/edges DOES change serializeRoutingGraph signature
+    const switchedGraph: WorkflowGraph = {
+      ...twoIfacesGraph,
+      nodes: twoIfacesGraph.nodes.map((n) =>
+        n.kind.type === "interface"
+          ? { ...n, kind: { ...n.kind, isDefault: n.id === "iface-eth" } }
+          : n
+      ),
+    };
+    expect(serializeRoutingGraph(switchedGraph)).not.toBe(serializeRoutingGraph(twoIfacesGraph));
+
+    mockTauri.listWorkflows.mockResolvedValue([wfTwo]);
+    await useNetFlowStore.getState().loadWorkflows();
+
+    // When stopped, setDefaultNode must NOT invoke applyWorkflow
+    useNetFlowStore.getState().setDefaultNode("iface-eth");
+    expect(mockTauri.applyWorkflow).not.toHaveBeenCalled();
+
+    // Reset default back to Wi-Fi and start routing
+    useNetFlowStore.getState().setDefaultNode("iface-wifi");
+    mockTauri.applyWorkflow.mockResolvedValue(activeStatus("wf-two"));
+    expect(await useNetFlowStore.getState().applyCurrentWorkflow()).toBe(true);
+    expect(useNetFlowStore.getState().appliedGraphSignature).toBe(
+      serializeRoutingGraph(useNetFlowStore.getState().graph)
+    );
+
+    // Now while routing is Active, switching default to Ethernet auto-validates & hot-applies
+    mockTauri.validateWorkflowGraph.mockClear();
+    mockTauri.applyWorkflow.mockClear();
+    mockTauri.applyWorkflow.mockResolvedValue(activeStatus("wf-two"));
+
+    useNetFlowStore.getState().setDefaultNode("iface-eth");
+
+    await vi.waitFor(() => {
+      expect(mockTauri.applyWorkflow).toHaveBeenCalledTimes(1);
+    });
+    expect(mockTauri.validateWorkflowGraph).toHaveBeenCalledTimes(1);
+    const [, appliedGraph] = mockTauri.applyWorkflow.mock.calls[0] as [string | null, WorkflowGraph];
+    expect(appliedGraph.nodes.find((n) => n.id === "iface-eth")?.kind).toMatchObject({
+      isDefault: true,
+    });
+    expect(appliedGraph.nodes.find((n) => n.id === "iface-wifi")?.kind).toMatchObject({
+      isDefault: false,
+    });
+    expect(useNetFlowStore.getState().appliedGraphSignature).toBe(
+      serializeRoutingGraph(appliedGraph)
+    );
+  });
+
+  it("manages app settings, saved app groups, and ignores cosmetic apps metadata in routing signature", async () => {
+    const baseGraph = makeGraph();
+    const relabeledGraph: WorkflowGraph = {
+      ...baseGraph,
+      nodes: baseGraph.nodes.map((n) =>
+        n.id === "apps-1"
+          ? {
+              ...n,
+              kind: {
+                ...n.kind,
+                label: "Browsers",
+                iconDataUrl: "data:image/png;base64,AAAA",
+              },
+            }
+          : n
+      ),
+    };
+    expect(serializeRoutingGraph(relabeledGraph)).toBe(serializeRoutingGraph(baseGraph));
+
+    mockTauri.getAppSettings.mockResolvedValue({
+      startWithWindows: true,
+      autoApplyLastWorkflow: false,
+      lastActiveWorkflowId: "wf-a",
+    });
+    await useNetFlowStore.getState().loadAppSettings();
+    expect(useNetFlowStore.getState().appSettings.startWithWindows).toBe(true);
+
+    mockTauri.updateAppSettings.mockResolvedValue({
+      startWithWindows: true,
+      autoApplyLastWorkflow: true,
+      lastActiveWorkflowId: "wf-a",
+    });
+    await useNetFlowStore.getState().updateAppSettings({ autoApplyLastWorkflow: true });
+    expect(useNetFlowStore.getState().appSettings.autoApplyLastWorkflow).toBe(true);
+
+    mockTauri.saveAppGroup.mockResolvedValue({
+      id: "grp-1",
+      name: "Browsers",
+      apps: ["chrome.exe", "firefox.exe"],
+      iconDataUrl: null,
+      updatedAt: "2026-11-24T20:00:00Z",
+    });
+    const savedGroup = await useNetFlowStore.getState().saveAppGroup({
+      name: "  Browsers ",
+      apps: ["Chrome.exe", "firefox.exe", "chrome.exe"],
+    });
+    expect(savedGroup?.id).toBe("grp-1");
+    expect(useNetFlowStore.getState().savedAppGroups).toHaveLength(1);
+
+    mockTauri.deleteAppGroup.mockResolvedValue(null);
+    const deleted = await useNetFlowStore.getState().deleteAppGroup("grp-1");
+    expect(deleted).toBe(true);
+    expect(useNetFlowStore.getState().savedAppGroups).toEqual([]);
   });
 });

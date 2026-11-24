@@ -3,12 +3,18 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use netflow_core::app_groups::{AppGroupStore, SavedAppGroup};
+use netflow_core::autostart::AutoStartManager;
 use netflow_core::discovery::{DiscoverySnapshot, SystemDiscovery};
 use netflow_core::model::{SavedWorkflow, ValidationError, WorkflowGraph};
-use netflow_core::runtime::{EngineRuntime, EngineStatus, RuntimeEvent, RuntimeState};
-use netflow_core::storage::WorkflowStore;
+use netflow_core::runtime::{EngineRuntime, EngineStatus, RuntimeEvent, RuntimeError, RuntimeState};
+use netflow_core::settings::{AppSettings, SettingsStore};
+use netflow_core::storage::{StorageError, WorkflowStore};
 use netflow_core::validator::validate_graph;
+use netflow_core::vpn_adapters::VpnAdapterError;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, Runtime, State};
 use tokio::sync::broadcast;
 
@@ -105,17 +111,41 @@ pub fn resolve_sidecar_paths<R: Runtime>(app: &AppHandle<R>) -> SidecarPaths {
 }
 
 /// Returns `true` when closing the main window should hide to the system tray instead of exiting.
-pub fn should_hide_on_close_state(state: RuntimeState) -> bool {
-    matches!(
-        state,
-        RuntimeState::Active | RuntimeState::Warning | RuntimeState::Applying
-    )
+///
+/// NetFlow always minimizes to the system tray when clicking the window close button (`X`),
+/// leaving explicit exit to the tray context menu.
+pub fn should_hide_on_close_state(_state: RuntimeState) -> bool {
+    true
+}
+
+/// Returns `true` if process CLI arguments indicate an automated startup launch.
+pub fn is_autostart_launch<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter().any(|arg| {
+        let trimmed = arg.as_ref().trim();
+        trimmed.eq_ignore_ascii_case("--autostart") || trimmed.eq_ignore_ascii_case("--minimized")
+    })
+}
+
+/// Partial update payload for [`AppSettings`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AppSettingsUpdate {
+    pub start_with_windows: Option<bool>,
+    pub auto_apply_last_workflow: Option<bool>,
 }
 
 /// Shared managed application state backing Tauri IPC commands and lifecycle hooks.
 pub struct AppState {
     runtime: Arc<EngineRuntime>,
     workflow_store: WorkflowStore,
+    settings_store: SettingsStore,
+    app_group_store: AppGroupStore,
+    auto_start: Arc<dyn AutoStartManager>,
+    exe_path: PathBuf,
     discovery: Arc<dyn SystemDiscovery>,
     recovery_notice: Mutex<Option<String>>,
     exit_started: AtomicBool,
@@ -123,15 +153,23 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Creates a new [`AppState`] wrapping the core runtime, workflow store, and discovery provider.
+    /// Creates a new [`AppState`] wrapping the core runtime, stores, auto-start manager, and discovery provider.
     pub fn new(
         runtime: Arc<EngineRuntime>,
         workflow_store: WorkflowStore,
+        settings_store: SettingsStore,
+        app_group_store: AppGroupStore,
+        auto_start: Arc<dyn AutoStartManager>,
+        exe_path: PathBuf,
         discovery: Arc<dyn SystemDiscovery>,
     ) -> Self {
         Self {
             runtime,
             workflow_store,
+            settings_store,
+            app_group_store,
+            auto_start,
+            exe_path,
             discovery,
             recovery_notice: Mutex::new(None),
             exit_started: AtomicBool::new(false),
@@ -147,6 +185,11 @@ impl AppState {
     /// Returns a reference to the managed [`WorkflowStore`].
     pub fn workflow_store(&self) -> &WorkflowStore {
         &self.workflow_store
+    }
+
+    /// Returns a reference to the managed [`SettingsStore`].
+    pub fn settings_store(&self) -> &SettingsStore {
+        &self.settings_store
     }
 
     /// Returns a reference to the managed [`SystemDiscovery`] implementation.
@@ -237,6 +280,75 @@ impl AppState {
     /// Deletes a saved workflow by ID on a blocking worker thread.
     pub async fn delete_saved_workflow(&self, id: String) -> Result<(), String> {
         let store = self.workflow_store.clone();
+        let settings_store = self.settings_store.clone();
+        let deleted_id = id.clone();
+        run_blocking_cmd(move || {
+            store.delete(&deleted_id)?;
+            if let Ok(mut settings) = settings_store.load() {
+                if settings.last_active_workflow_id.as_deref() == Some(deleted_id.as_str()) {
+                    settings.last_active_workflow_id = None;
+                    let _ = settings_store.save(&settings);
+                }
+            }
+            Ok::<(), StorageError>(())
+        })
+        .await
+    }
+
+    /// Loads [`AppSettings`] and reconciles `start_with_windows` against the OS Task Scheduler.
+    pub async fn get_app_settings(&self) -> Result<AppSettings, String> {
+        let settings_store = self.settings_store.clone();
+        let auto_start = Arc::clone(&self.auto_start);
+        run_blocking_cmd(move || {
+            let mut settings = settings_store.load().map_err(|e| e.to_string())?;
+            if let Ok(actual_enabled) = auto_start.is_enabled() {
+                if settings.start_with_windows != actual_enabled {
+                    settings.start_with_windows = actual_enabled;
+                    let _ = settings_store.save(&settings);
+                }
+            }
+            Ok::<AppSettings, String>(settings)
+        })
+        .await
+    }
+
+    /// Updates [`AppSettings`] and applies OS Task Scheduler auto-start changes if requested.
+    pub async fn update_app_settings(&self, update: AppSettingsUpdate) -> Result<AppSettings, String> {
+        let settings_store = self.settings_store.clone();
+        let auto_start = Arc::clone(&self.auto_start);
+        let exe_path = self.exe_path.clone();
+        run_blocking_cmd(move || {
+            let mut settings = settings_store.load().map_err(|e| e.to_string())?;
+            if let Some(start_with_windows) = update.start_with_windows {
+                auto_start
+                    .set_enabled(start_with_windows, &exe_path)
+                    .map_err(|e| e.to_string())?;
+                settings.start_with_windows = start_with_windows;
+            }
+            if let Some(auto_apply) = update.auto_apply_last_workflow {
+                settings.auto_apply_last_workflow = auto_apply;
+            }
+            settings_store.save(&settings).map_err(|e| e.to_string())?;
+            Ok::<AppSettings, String>(settings)
+        })
+        .await
+    }
+
+    /// Loads persistent saved connection app groups from disk on a blocking worker thread.
+    pub async fn list_app_groups(&self) -> Result<Vec<SavedAppGroup>, String> {
+        let store = self.app_group_store.clone();
+        run_blocking_cmd(move || store.list()).await
+    }
+
+    /// Saves or updates a reusable named connection app group on a blocking worker thread.
+    pub async fn save_app_group(&self, group: SavedAppGroup) -> Result<SavedAppGroup, String> {
+        let store = self.app_group_store.clone();
+        run_blocking_cmd(move || store.save(group)).await
+    }
+
+    /// Deletes a saved connection app group by ID on a blocking worker thread.
+    pub async fn delete_app_group(&self, id: String) -> Result<(), String> {
+        let store = self.app_group_store.clone();
         run_blocking_cmd(move || store.delete(&id)).await
     }
 
@@ -246,10 +358,77 @@ impl AppState {
         workflow_id: Option<String>,
         graph: WorkflowGraph,
     ) -> Result<EngineStatus, String> {
-        self.runtime
-            .apply(workflow_id, &graph)
+        let status = self
+            .runtime
+            .apply(workflow_id.clone(), &graph)
             .await
-            .map_err(|err| err.to_string())
+            .map_err(|err| err.to_string())?;
+
+        if let Some(id) = workflow_id {
+            let settings_store = self.settings_store.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Ok(mut settings) = settings_store.load() {
+                    if settings.last_active_workflow_id.as_deref() != Some(id.as_str()) {
+                        settings.last_active_workflow_id = Some(id);
+                        let _ = settings_store.save(&settings);
+                    }
+                }
+            })
+            .await;
+        }
+
+        Ok(status)
+    }
+
+    /// Auto-applies the last active workflow during `--autostart` boot if enabled in settings.
+    pub async fn run_autostart_workflow_if_enabled(&self) -> Result<Option<EngineStatus>, String> {
+        self.run_autostart_workflow_with_retries(5, Duration::from_secs(2))
+            .await
+    }
+
+    /// Internal helper with configurable retry budget for boot-time network/VPN readiness.
+    pub async fn run_autostart_workflow_with_retries(
+        &self,
+        max_attempts: usize,
+        retry_delay: Duration,
+    ) -> Result<Option<EngineStatus>, String> {
+        let settings_store = self.settings_store.clone();
+        let workflow_store = self.workflow_store.clone();
+
+        let target_workflow = run_blocking_cmd(move || {
+            let settings = settings_store.load().map_err(|e| e.to_string())?;
+            if !settings.auto_apply_last_workflow {
+                return Ok::<Option<SavedWorkflow>, String>(None);
+            }
+            let Some(wf_id) = settings.last_active_workflow_id else {
+                return Ok(None);
+            };
+            match workflow_store.load(&wf_id) {
+                Ok(wf) => Ok(Some(wf)),
+                Err(StorageError::NotFound(_)) => Ok(None),
+                Err(err) => Err(err.to_string()),
+            }
+        })
+        .await?;
+
+        let Some(wf) = target_workflow else {
+            return Ok(None);
+        };
+
+        let attempts = max_attempts.max(1);
+        for attempt in 0..attempts {
+            match self.runtime.apply(Some(wf.id.clone()), &wf.graph).await {
+                Ok(status) => return Ok(Some(status)),
+                Err(err) if is_transient_boot_error(&err) && attempt + 1 < attempts => {
+                    if !retry_delay.is_zero() {
+                        tokio::time::sleep(retry_delay).await;
+                    }
+                }
+                Err(err) => return Err(err.to_string()),
+            }
+        }
+
+        Ok(None)
     }
 
     /// Stops routing and restores all neutralized VPNs and Windows System Proxy.
@@ -261,6 +440,15 @@ impl AppState {
     pub fn engine_status(&self) -> EngineStatus {
         self.runtime.status()
     }
+}
+
+fn is_transient_boot_error(err: &RuntimeError) -> bool {
+    matches!(
+        err,
+        RuntimeError::InterfaceDown(_)
+            | RuntimeError::NoDefaultPhysicalInterface
+            | RuntimeError::VpnAdapter(VpnAdapterError::NotRunning(_))
+    )
 }
 
 /// Runs startup stale crash recovery, drains the matching `RecoveryNotice` from `event_rx`
@@ -385,6 +573,42 @@ pub fn take_recovery_notice(state: State<'_, AppState>) -> Option<String> {
     state.take_recovery_notice_value()
 }
 
+/// Loads persistent NetFlow application settings reconciled with Task Scheduler auto-start state.
+#[tauri::command]
+pub async fn get_app_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
+    state.get_app_settings().await
+}
+
+/// Updates persistent NetFlow application settings and Windows Task Scheduler auto-start registration.
+#[tauri::command]
+pub async fn update_app_settings(
+    state: State<'_, AppState>,
+    update: AppSettingsUpdate,
+) -> Result<AppSettings, String> {
+    state.update_app_settings(update).await
+}
+
+/// Lists all saved reusable connection app groups sorted by `updatedAt` descending.
+#[tauri::command]
+pub async fn list_app_groups(state: State<'_, AppState>) -> Result<Vec<SavedAppGroup>, String> {
+    state.list_app_groups().await
+}
+
+/// Saves or updates a reusable named connection app group on disk.
+#[tauri::command]
+pub async fn save_app_group(
+    state: State<'_, AppState>,
+    group: SavedAppGroup,
+) -> Result<SavedAppGroup, String> {
+    state.save_app_group(group).await
+}
+
+/// Deletes a saved connection app group by ID.
+#[tauri::command]
+pub async fn delete_app_group(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.delete_app_group(id).await
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -392,6 +616,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
 
+    use netflow_core::autostart::{AutoStartError, AutoStartManager};
     use netflow_core::discovery::{
         DetectedVpnInfo, DiscoveryError, DiscoverySnapshot, PhysicalInterfaceInfo,
         RunningProcessInfo, SystemDiscovery,
@@ -406,6 +631,7 @@ mod tests {
     use netflow_core::runtime::{
         EngineRuntime, EngineRuntimeConfig, RuntimeState, SidecarError, SidecarRunner,
     };
+    use netflow_core::settings::SettingsStore;
     use netflow_core::storage::WorkflowStore;
     use netflow_core::win_net::{NetOpsError, WindowsNetworkOps};
 
@@ -469,6 +695,7 @@ mod tests {
                         exe_name: "chrome.exe".to_string(),
                         path: Some(r"C:\Program Files\Google\Chrome\Application\chrome.exe".into()),
                     }],
+                    open_apps: Vec::new(),
                 },
             }
         }
@@ -607,7 +834,45 @@ mod tests {
         }
     }
 
-    fn build_test_app_state(temp: &Path, net_ops: Arc<MockNetOps>) -> AppState {
+    struct MockAutoStart {
+        enabled: AtomicBool,
+        last_exe_path: Mutex<Option<PathBuf>>,
+    }
+
+    impl MockAutoStart {
+        fn new(initial: bool) -> Self {
+            Self {
+                enabled: AtomicBool::new(initial),
+                last_exe_path: Mutex::new(None),
+            }
+        }
+
+        fn set_os_enabled(&self, enabled: bool) {
+            self.enabled.store(enabled, Ordering::SeqCst);
+        }
+
+        fn last_exe_path(&self) -> Option<PathBuf> {
+            self.last_exe_path.lock().unwrap().clone()
+        }
+    }
+
+    impl AutoStartManager for MockAutoStart {
+        fn is_enabled(&self) -> Result<bool, AutoStartError> {
+            Ok(self.enabled.load(Ordering::SeqCst))
+        }
+
+        fn set_enabled(&self, enabled: bool, exe_path: &Path) -> Result<(), AutoStartError> {
+            self.enabled.store(enabled, Ordering::SeqCst);
+            *self.last_exe_path.lock().unwrap() = Some(exe_path.to_path_buf());
+            Ok(())
+        }
+    }
+
+    fn build_test_app_state_with_autostart(
+        temp: &Path,
+        net_ops: Arc<MockNetOps>,
+        auto_start: Arc<dyn AutoStartManager>,
+    ) -> AppState {
         let discovery: Arc<dyn SystemDiscovery> = Arc::new(MockDiscovery::healthy_wifi());
         let sidecar: Arc<dyn SidecarRunner> = Arc::new(MockSidecar::default());
         let recovery_store = RecoveryStore::new(temp.join("recovery.json"));
@@ -626,7 +891,22 @@ mod tests {
             runtime_config,
         ));
         let workflow_store = WorkflowStore::new(temp.join("workflows"));
-        AppState::new(runtime, workflow_store, discovery)
+        let settings_store = SettingsStore::new(temp.join("settings.json"));
+        let app_group_store = AppGroupStore::new(temp.join("app-groups.json"));
+        let exe_path = temp.join("NetFlow.exe");
+        AppState::new(
+            runtime,
+            workflow_store,
+            settings_store,
+            app_group_store,
+            auto_start,
+            exe_path,
+            discovery,
+        )
+    }
+
+    fn build_test_app_state(temp: &Path, net_ops: Arc<MockNetOps>) -> AppState {
+        build_test_app_state_with_autostart(temp, net_ops, Arc::new(MockAutoStart::new(false)))
     }
 
     fn sample_valid_graph() -> WorkflowGraph {
@@ -647,6 +927,8 @@ mod tests {
                     y: 100.0,
                     kind: NodeKind::Apps {
                         apps: vec!["chrome.exe".to_string()],
+                        label: None,
+                        icon_data_url: None,
                     },
                 },
             ],
@@ -680,6 +962,8 @@ mod tests {
                     y: 0.0,
                     kind: NodeKind::Apps {
                         apps: vec!["chrome.exe".to_string()],
+                        label: None,
+                        icon_data_url: None,
                     },
                 },
                 WorkflowNode {
@@ -688,6 +972,8 @@ mod tests {
                     y: 120.0,
                     kind: NodeKind::Apps {
                         apps: vec![" CHROME.EXE ".to_string()],
+                        label: None,
+                        icon_data_url: None,
                     },
                 },
             ],
@@ -798,13 +1084,13 @@ mod tests {
         );
         assert_eq!(state.take_recovery_notice_value(), None);
 
-        assert!(!should_hide_on_close_state(RuntimeState::Stopped));
-        assert!(!should_hide_on_close_state(RuntimeState::Error));
+        assert!(should_hide_on_close_state(RuntimeState::Stopped));
+        assert!(should_hide_on_close_state(RuntimeState::Error));
         assert!(should_hide_on_close_state(RuntimeState::Active));
         assert!(should_hide_on_close_state(RuntimeState::Warning));
         assert!(should_hide_on_close_state(RuntimeState::Applying));
 
-        assert!(!state.should_hide_on_close());
+        assert!(state.should_hide_on_close());
         assert!(state.try_begin_exit());
         assert!(!state.try_begin_exit());
         assert!(!state.is_exit_ready());
@@ -864,14 +1150,27 @@ mod tests {
 
         let stopped_status = state.stop_routing().await.expect("stop routing");
         assert_eq!(stopped_status.state, RuntimeState::Stopped);
-        assert!(!state.should_hide_on_close());
+        assert!(state.should_hide_on_close());
         assert_eq!(net_ops.current_proxy().proxy_enable, 1);
+
+        let settings_after_apply = state.get_app_settings().await.expect("get settings");
+        assert_eq!(
+            settings_after_apply.last_active_workflow_id.as_deref(),
+            Some("wf-main")
+        );
+
+        state
+            .delete_saved_workflow("wf-main".to_string())
+            .await
+            .expect("delete active-recorded workflow");
+        let settings_after_delete = state.get_app_settings().await.expect("get settings");
+        assert_eq!(settings_after_delete.last_active_workflow_id, None);
 
         state
             .delete_saved_workflow(dup.id)
             .await
             .expect("delete duplicate");
-        assert_eq!(state.list_saved_workflows().await.unwrap().len(), 1);
+        assert_eq!(state.list_saved_workflows().await.unwrap().len(), 0);
     }
 
     #[test]
@@ -925,5 +1224,126 @@ mod tests {
         assert!(notice.starts_with("Startup crash recovery failed:"));
         assert_eq!(state.take_recovery_notice_value(), Some(notice));
         assert_eq!(state.take_recovery_notice_value(), None);
+    }
+
+    #[test]
+    fn test_is_autostart_launch_parses_flags() {
+        assert!(!is_autostart_launch(["NetFlow.exe"]));
+        assert!(is_autostart_launch(["NetFlow.exe", "--autostart"]));
+        assert!(is_autostart_launch(["NetFlow.exe", "--MINIMIZED"]));
+    }
+
+    #[tokio::test]
+    async fn test_app_settings_toggle_autostart_and_reconcile() {
+        let temp = TempDirGuard::new("netflow-settings-autostart");
+        let net_ops = Arc::new(MockNetOps::default());
+        let mock_autostart = Arc::new(MockAutoStart::new(false));
+        let state = build_test_app_state_with_autostart(
+            temp.path(),
+            net_ops,
+            Arc::clone(&mock_autostart) as Arc<dyn AutoStartManager>,
+        );
+
+        let initial = state.get_app_settings().await.expect("initial settings");
+        assert!(!initial.start_with_windows);
+        assert!(!initial.auto_apply_last_workflow);
+
+        let updated = state
+            .update_app_settings(AppSettingsUpdate {
+                start_with_windows: Some(true),
+                auto_apply_last_workflow: Some(true),
+            })
+            .await
+            .expect("enable autostart");
+        assert!(updated.start_with_windows);
+        assert!(updated.auto_apply_last_workflow);
+        assert!(mock_autostart.is_enabled().unwrap());
+        assert_eq!(
+            mock_autostart.last_exe_path(),
+            Some(temp.path().join("NetFlow.exe"))
+        );
+
+        // Simulate user deleting the scheduled task externally -> get_app_settings reconciles
+        mock_autostart.set_os_enabled(false);
+        let reconciled = state.get_app_settings().await.expect("reconcile settings");
+        assert!(!reconciled.start_with_windows);
+        assert!(reconciled.auto_apply_last_workflow);
+    }
+
+    #[tokio::test]
+    async fn test_autostart_workflow_applies_last_active_workflow_when_enabled_and_skips_when_disabled() {
+        let temp = TempDirGuard::new("netflow-autostart-apply");
+        let net_ops = Arc::new(MockNetOps::default());
+        let state = build_test_app_state(temp.path(), net_ops);
+
+        let workflow = SavedWorkflow {
+            id: "wf-boot".to_string(),
+            name: "Boot Flow".to_string(),
+            updated_at: String::new(),
+            graph: sample_valid_graph(),
+        };
+        state.save_saved_workflow(workflow).await.expect("save wf");
+        state
+            .apply_workflow(Some("wf-boot".to_string()), sample_valid_graph())
+            .await
+            .expect("apply sets last_active_workflow_id");
+        state.stop_routing().await.expect("stop before simulated reboot");
+
+        // Disabled by default -> autostart does nothing
+        let skipped = state
+            .run_autostart_workflow_with_retries(1, Duration::ZERO)
+            .await
+            .expect("autostart skip");
+        assert!(skipped.is_none());
+        assert_eq!(state.engine_status().state, RuntimeState::Stopped);
+
+        // Enable auto_apply_last_workflow -> autostart applies wf-boot
+        state
+            .update_app_settings(AppSettingsUpdate {
+                start_with_windows: None,
+                auto_apply_last_workflow: Some(true),
+            })
+            .await
+            .expect("enable auto_apply");
+
+        let applied = state
+            .run_autostart_workflow_with_retries(2, Duration::ZERO)
+            .await
+            .expect("autostart apply")
+            .expect("should apply last workflow");
+        assert_eq!(applied.state, RuntimeState::Active);
+        assert_eq!(applied.active_workflow_id.as_deref(), Some("wf-boot"));
+    }
+
+    #[tokio::test]
+    async fn test_app_state_saved_app_groups_crud() {
+        let temp = TempDirGuard::new("netflow-appstate-groups");
+        let net_ops = Arc::new(MockNetOps::default());
+        let state = build_test_app_state(temp.path(), net_ops);
+
+        assert!(state.list_app_groups().await.expect("initial list").is_empty());
+
+        let saved = state
+            .save_app_group(SavedAppGroup {
+                id: String::new(),
+                name: "Browsers".to_string(),
+                apps: vec!["chrome.exe".to_string(), "firefox.exe".to_string()],
+                icon_data_url: None,
+                updated_at: String::new(),
+            })
+            .await
+            .expect("save app group");
+        assert!(!saved.id.is_empty());
+        assert_eq!(saved.name, "Browsers");
+        assert_eq!(saved.apps, vec!["chrome.exe", "firefox.exe"]);
+
+        let listed = state.list_app_groups().await.expect("list groups");
+        assert_eq!(listed, vec![saved.clone()]);
+
+        state
+            .delete_app_group(saved.id)
+            .await
+            .expect("delete group");
+        assert!(state.list_app_groups().await.expect("empty after delete").is_empty());
     }
 }

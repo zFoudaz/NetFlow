@@ -328,6 +328,8 @@ mod tests {
                     y: 200.0,
                     kind: NodeKind::Apps {
                         apps: vec!["game.exe".to_string(), "discord.exe".to_string()],
+                        label: None,
+                        icon_data_url: None,
                     },
                 },
             ],

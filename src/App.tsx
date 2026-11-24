@@ -11,6 +11,8 @@ export function App() {
   const refreshDiscovery = useNetFlowStore((s) => s.refreshDiscovery);
   const hydrateCanvasDraft = useNetFlowStore((s) => s.hydrateCanvasDraft);
   const loadWorkflows = useNetFlowStore((s) => s.loadWorkflows);
+  const loadAppSettings = useNetFlowStore((s) => s.loadAppSettings);
+  const loadAppGroups = useNetFlowStore((s) => s.loadAppGroups);
 
   useEffect(() => {
     let active = true;
@@ -32,12 +34,21 @@ export function App() {
 
     void refreshDiscovery();
     void loadWorkflows();
+    void loadAppSettings();
+    void loadAppGroups();
 
     return () => {
       active = false;
       cleanup?.();
     };
-  }, [hydrateCanvasDraft, initEventListeners, loadWorkflows, refreshDiscovery]);
+  }, [
+    hydrateCanvasDraft,
+    initEventListeners,
+    loadAppGroups,
+    loadAppSettings,
+    loadWorkflows,
+    refreshDiscovery,
+  ]);
 
   return (
     <div

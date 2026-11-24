@@ -44,6 +44,7 @@ pub struct ResolvedVpnRuntimeInfo {
 pub struct CompileInput {
     pub validated: ValidatedGraph,
     pub default_physical_interface: String,
+    pub interface_ipv4s: HashMap<String, String>,
     pub vpn_runtime: HashMap<VpnProvider, ResolvedVpnRuntimeInfo>,
     pub clash_api_port: u16,
     pub log_path: PathBuf,
@@ -81,6 +82,7 @@ struct InterfaceOutbound {
     alias: String,
     outbound_tag: String,
     dns_tag: String,
+    bind_ipv4: Option<String>,
 }
 
 enum VpnOutboundKind {
@@ -123,6 +125,7 @@ pub fn compile_singbox_config(input: &CompileInput) -> Result<CompiledConfig, Co
 
     let interface_outbounds = build_interface_outbounds(
         &input.validated,
+        &input.interface_ipv4s,
         &mut used_tags,
         &mut node_to_outbound,
         &mut outbound_to_node_id,
@@ -148,6 +151,7 @@ pub fn compile_singbox_config(input: &CompileInput) -> Result<CompiledConfig, Co
         None => (DEFAULT_DIRECT_TAG.to_string(), true),
     };
 
+    let default_iface_bind_ipv4 = lookup_bind_ipv4(&input.interface_ipv4s, default_iface);
     let dns_final_tag =
         resolve_dns_final_tag(&final_outbound_tag, &interface_outbounds, &vpn_outbounds);
 
@@ -155,6 +159,7 @@ pub fn compile_singbox_config(input: &CompileInput) -> Result<CompiledConfig, Co
     let dns_section = build_dns_section(
         &input.validated,
         default_iface,
+        default_iface_bind_ipv4.as_deref(),
         &interface_outbounds,
         &vpn_outbounds,
         dns_final_tag,
@@ -162,6 +167,7 @@ pub fn compile_singbox_config(input: &CompileInput) -> Result<CompiledConfig, Co
     let inbounds_section = build_inbounds_section();
     let outbounds_section = build_outbounds_section(
         default_iface,
+        default_iface_bind_ipv4.as_deref(),
         use_default_direct,
         &interface_outbounds,
         &vpn_outbounds,
@@ -171,6 +177,7 @@ pub fn compile_singbox_config(input: &CompileInput) -> Result<CompiledConfig, Co
         &node_to_outbound,
         &vpn_outbounds,
         &final_outbound_tag,
+        dns_final_tag,
     )?;
 
     let cache_path = input.log_path.with_file_name("cache.db");
@@ -200,6 +207,7 @@ pub fn compile_singbox_config(input: &CompileInput) -> Result<CompiledConfig, Co
 
 fn build_interface_outbounds(
     validated: &ValidatedGraph,
+    interface_ipv4s: &HashMap<String, String>,
     used_tags: &mut HashSet<String>,
     node_to_outbound: &mut HashMap<String, String>,
     outbound_to_node_id: &mut HashMap<String, String>,
@@ -231,6 +239,7 @@ fn build_interface_outbounds(
 
         let outbound_tag = unique_interface_tag(alias, used_tags);
         let dns_tag = format!("dns-{outbound_tag}");
+        let bind_ipv4 = lookup_bind_ipv4(interface_ipv4s, alias);
 
         node_to_outbound.insert(node_id.clone(), outbound_tag.clone());
         outbound_to_node_id.insert(outbound_tag.clone(), node_id.clone());
@@ -239,6 +248,7 @@ fn build_interface_outbounds(
             alias: alias.to_string(),
             outbound_tag,
             dns_tag,
+            bind_ipv4,
         });
     }
 
@@ -341,8 +351,17 @@ fn resolve_dns_final_tag<'a>(
         .iter()
         .find(|v| v.outbound_tag == final_outbound_tag)
     {
-        if let VpnOutboundKind::TunDirect { dns_tag, .. } = &vpn.kind {
-            return dns_tag;
+        match &vpn.kind {
+            VpnOutboundKind::TunDirect { dns_tag, .. } => return dns_tag,
+            VpnOutboundKind::Socks { .. } => {
+                if let Some(root_iface) = interface_outbounds.iter().find(|iface| {
+                    iface
+                        .alias
+                        .eq_ignore_ascii_case(&vpn.chain.root_interface_alias)
+                }) {
+                    return &root_iface.dns_tag;
+                }
+            }
         }
     }
     DNS_DEFAULT_TAG
@@ -351,24 +370,37 @@ fn resolve_dns_final_tag<'a>(
 fn build_dns_section(
     validated: &ValidatedGraph,
     default_iface: &str,
+    default_iface_bind_ipv4: Option<&str>,
     interface_outbounds: &[InterfaceOutbound],
     vpn_outbounds: &[ResolvedVpnOutbound],
     dns_final_tag: &str,
 ) -> Value {
-    let mut servers = vec![json!({
+    let mut default_dns = json!({
         "type": "udp",
         "tag": DNS_DEFAULT_TAG,
         "server": DNS_BOOTSTRAP_SERVER,
         "bind_interface": default_iface
-    })];
+    });
+    if let Some(ip) = default_iface_bind_ipv4 {
+        if let Some(obj) = default_dns.as_object_mut() {
+            obj.insert("inet4_bind_address".to_string(), json!(ip));
+        }
+    }
+    let mut servers = vec![default_dns];
 
     for iface in interface_outbounds {
-        servers.push(json!({
+        let mut entry = json!({
             "type": "udp",
             "tag": iface.dns_tag,
             "server": DNS_BOOTSTRAP_SERVER,
             "bind_interface": iface.alias
-        }));
+        });
+        if let Some(ip) = iface.bind_ipv4.as_deref() {
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert("inet4_bind_address".to_string(), json!(ip));
+            }
+        }
+        servers.push(entry);
     }
 
     for vpn in vpn_outbounds {
@@ -444,6 +476,7 @@ fn build_inbounds_section() -> Value {
 
 fn build_outbounds_section(
     default_iface: &str,
+    default_iface_bind_ipv4: Option<&str>,
     use_default_direct: bool,
     interface_outbounds: &[InterfaceOutbound],
     vpn_outbounds: &[ResolvedVpnOutbound],
@@ -454,21 +487,33 @@ fn build_outbounds_section(
     })];
 
     if use_default_direct {
-        outbounds.push(json!({
+        let mut entry = json!({
             "type": "direct",
             "tag": DEFAULT_DIRECT_TAG,
             "bind_interface": default_iface,
             "domain_resolver": DNS_DEFAULT_TAG
-        }));
+        });
+        if let Some(ip) = default_iface_bind_ipv4 {
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert("inet4_bind_address".to_string(), json!(ip));
+            }
+        }
+        outbounds.push(entry);
     }
 
     for iface in interface_outbounds {
-        outbounds.push(json!({
+        let mut entry = json!({
             "type": "direct",
             "tag": iface.outbound_tag,
             "bind_interface": iface.alias,
             "domain_resolver": iface.dns_tag
-        }));
+        });
+        if let Some(ip) = iface.bind_ipv4.as_deref() {
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert("inet4_bind_address".to_string(), json!(ip));
+            }
+        }
+        outbounds.push(entry);
     }
 
     for vpn in vpn_outbounds {
@@ -504,6 +549,7 @@ fn build_route_section(
     node_to_outbound: &HashMap<String, String>,
     vpn_outbounds: &[ResolvedVpnOutbound],
     final_outbound_tag: &str,
+    dns_final_tag: &str,
 ) -> Result<Value, CompileError> {
     // 1. Sniff -> 2. DNS Hijack -> 3. IPv6 Reject -> 4. Private LAN Direct (excluding FakeIP)
     let mut rules = vec![
@@ -569,7 +615,7 @@ fn build_route_section(
 
     Ok(json!({
         "auto_detect_interface": true,
-        "default_domain_resolver": DNS_DEFAULT_TAG,
+        "default_domain_resolver": dns_final_tag,
         "rules": rules,
         "final": final_outbound_tag
     }))
@@ -633,6 +679,27 @@ fn non_empty_trimmed(opt: Option<&str>) -> Option<String> {
     opt.map(str::trim)
         .filter(|s| !s.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn lookup_bind_ipv4(interface_ipv4s: &HashMap<String, String>, alias: &str) -> Option<String> {
+    let trimmed_alias = alias.trim();
+    if trimmed_alias.is_empty() {
+        return None;
+    }
+    let raw = interface_ipv4s
+        .iter()
+        .find(|(k, _)| k.trim().eq_ignore_ascii_case(trimmed_alias))
+        .map(|(_, v)| v.trim())?;
+    let ip: Ipv4Addr = raw.parse().ok()?;
+    if ip.is_unspecified()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_multicast()
+        || ip.is_broadcast()
+    {
+        return None;
+    }
+    Some(ip.to_string())
 }
 
 fn normalize_ipv4_host_cidr(raw: &str) -> Result<String, CompileError> {
@@ -715,6 +782,8 @@ mod tests {
             y: 0.0,
             kind: NodeKind::Apps {
                 apps: apps.iter().map(|s| (*s).to_string()).collect(),
+                label: None,
+                icon_data_url: None,
             },
         }
     }
@@ -781,6 +850,7 @@ mod tests {
         let compiled = compile_singbox_config(&CompileInput {
             validated,
             default_physical_interface: "Wi-Fi".to_string(),
+            interface_ipv4s: HashMap::new(),
             vpn_runtime,
             clash_api_port: 9090,
             log_path: PathBuf::from(r"C:\ProgramData\NetFlow\sing-box.log"),
@@ -934,6 +1004,7 @@ mod tests {
         let compiled = compile_singbox_config(&CompileInput {
             validated,
             default_physical_interface: "Wi-Fi".to_string(),
+            interface_ipv4s: HashMap::new(),
             vpn_runtime,
             clash_api_port: 9090,
             log_path: PathBuf::from("sing-box.log"),
@@ -991,6 +1062,7 @@ mod tests {
         let compiled_2 = compile_singbox_config(&CompileInput {
             validated: validate_graph(&direct_iface_graph).unwrap(),
             default_physical_interface: "Wi-Fi".to_string(),
+            interface_ipv4s: HashMap::new(),
             vpn_runtime: vpn_runtime_2,
             clash_api_port: 9090,
             log_path: PathBuf::from("sing-box.log"),
@@ -1040,6 +1112,7 @@ mod tests {
         let compiled = compile_singbox_config(&CompileInput {
             validated,
             default_physical_interface: "Wi-Fi".to_string(),
+            interface_ipv4s: HashMap::new(),
             vpn_runtime,
             clash_api_port: 9090,
             log_path: PathBuf::from("sing-box.log"),
@@ -1047,6 +1120,11 @@ mod tests {
         .expect("compile should succeed");
 
         assert_eq!(compiled.json["route"]["final"], "vpn-karing");
+        assert_eq!(compiled.json["dns"]["final"], "dns-iface-wi-fi");
+        assert_eq!(
+            compiled.json["route"]["default_domain_resolver"],
+            "dns-iface-wi-fi"
+        );
 
         let rules = compiled.json["route"]["rules"].as_array().unwrap();
         let mut observed_regexes = Vec::new();
@@ -1158,6 +1236,7 @@ mod tests {
         let compiled = compile_singbox_config(&CompileInput {
             validated,
             default_physical_interface: "Wi-Fi".to_string(),
+            interface_ipv4s: HashMap::new(),
             vpn_runtime,
             clash_api_port: 9090,
             log_path: PathBuf::from("sing-box.log"),
@@ -1165,6 +1244,10 @@ mod tests {
         .expect("compile should succeed");
 
         assert_eq!(compiled.json["dns"]["final"], "dns-iface-lan-2");
+        assert_eq!(
+            compiled.json["route"]["default_domain_resolver"],
+            "dns-iface-lan-2"
+        );
         assert_passes_real_singbox_check(&compiled.json);
 
         // Also validate a default-direct + Karing -> OpenVPN chained configuration
@@ -1190,6 +1273,7 @@ mod tests {
         let chained_compiled = compile_singbox_config(&CompileInput {
             validated: validate_graph(&chained_graph).unwrap(),
             default_physical_interface: "Wi-Fi".to_string(),
+            interface_ipv4s: HashMap::new(),
             vpn_runtime: chained_rt,
             clash_api_port: 9090,
             log_path: PathBuf::from("sing-box.log"),
@@ -1197,6 +1281,10 @@ mod tests {
         .expect("compile should succeed");
 
         assert_eq!(chained_compiled.json["dns"]["final"], "dns-default");
+        assert_eq!(
+            chained_compiled.json["route"]["default_domain_resolver"],
+            "dns-default"
+        );
         assert_passes_real_singbox_check(&chained_compiled.json);
     }
 
@@ -1218,6 +1306,7 @@ mod tests {
         let err = compile_singbox_config(&CompileInput {
             validated: validated.clone(),
             default_physical_interface: "  ".to_string(),
+            interface_ipv4s: HashMap::new(),
             vpn_runtime: HashMap::new(),
             clash_api_port: 9090,
             log_path: PathBuf::from("sing-box.log"),
@@ -1228,6 +1317,7 @@ mod tests {
         let err = compile_singbox_config(&CompileInput {
             validated: validated.clone(),
             default_physical_interface: "Wi-Fi".to_string(),
+            interface_ipv4s: HashMap::new(),
             vpn_runtime: HashMap::new(),
             clash_api_port: 0,
             log_path: PathBuf::from("sing-box.log"),
@@ -1238,6 +1328,7 @@ mod tests {
         let err = compile_singbox_config(&CompileInput {
             validated: validated.clone(),
             default_physical_interface: "Wi-Fi".to_string(),
+            interface_ipv4s: HashMap::new(),
             vpn_runtime: HashMap::new(),
             clash_api_port: 9090,
             log_path: PathBuf::from("sing-box.log"),
@@ -1263,6 +1354,7 @@ mod tests {
         let err = compile_singbox_config(&CompileInput {
             validated,
             default_physical_interface: "Wi-Fi".to_string(),
+            interface_ipv4s: HashMap::new(),
             vpn_runtime: missing_port,
             clash_api_port: 9090,
             log_path: PathBuf::from("sing-box.log"),
@@ -1291,6 +1383,7 @@ mod tests {
         let err = compile_singbox_config(&CompileInput {
             validated: validate_graph(&ovpn_graph).unwrap(),
             default_physical_interface: "Wi-Fi".to_string(),
+            interface_ipv4s: HashMap::new(),
             vpn_runtime: ovpn_rt,
             clash_api_port: 9090,
             log_path: PathBuf::from("sing-box.log"),
@@ -1321,6 +1414,7 @@ mod tests {
         let compiled = compile_singbox_config(&CompileInput {
             validated: validate_graph(&graph).unwrap(),
             default_physical_interface: "Wi-Fi".to_string(),
+            interface_ipv4s: HashMap::new(),
             vpn_runtime,
             clash_api_port: 9090,
             log_path: PathBuf::from("sing-box.log"),
@@ -1328,6 +1422,11 @@ mod tests {
         .expect("compile should succeed");
 
         assert_eq!(compiled.json["route"]["final"], "vpn-karing");
+        assert_eq!(compiled.json["dns"]["final"], "dns-iface-wi-fi");
+        assert_eq!(
+            compiled.json["route"]["default_domain_resolver"],
+            "dns-iface-wi-fi"
+        );
         assert_eq!(compiled.outbound_to_node_id.len(), 3);
         let tags: HashSet<&String> = compiled.outbound_to_node_id.keys().collect();
         assert_eq!(tags.len(), 3);
@@ -1358,6 +1457,7 @@ mod tests {
         let compiled = compile_singbox_config(&CompileInput {
             validated,
             default_physical_interface: "Wi-Fi".to_string(),
+            interface_ipv4s: HashMap::new(),
             vpn_runtime,
             clash_api_port: 19090,
             log_path: PathBuf::from("sing-box.log"),
@@ -1395,5 +1495,102 @@ mod tests {
         );
         assert_eq!(dns_rules[karing_dns_idx]["server"], "dns-iface-wi-fi");
         assert_eq!(dns_rules[ovpn_dns_idx]["server"], "dns-iface-wi-fi");
+    }
+
+    #[test]
+    fn test_non_windows_default_interface_emits_inet4_bind_address_and_dns_final() {
+        let graph = WorkflowGraph {
+            nodes: vec![
+                iface_node("if-wifi", "Wi-Fi", false),
+                iface_node("if-eth", "Ethernet", true),
+            ],
+            edges: vec![],
+        };
+
+        let mut interface_ipv4s = HashMap::new();
+        interface_ipv4s.insert("Wi-Fi".to_string(), "192.168.1.15".to_string());
+        interface_ipv4s.insert("Ethernet".to_string(), "192.168.42.50".to_string());
+
+        let compiled = compile_singbox_config(&CompileInput {
+            validated: validate_graph(&graph).expect("valid graph"),
+            default_physical_interface: "Wi-Fi".to_string(),
+            interface_ipv4s,
+            vpn_runtime: HashMap::new(),
+            clash_api_port: 9090,
+            log_path: PathBuf::from("sing-box.log"),
+        })
+        .expect("compile should succeed");
+
+        assert_eq!(compiled.json["route"]["final"], "iface-ethernet");
+        assert_eq!(compiled.json["dns"]["final"], "dns-iface-ethernet");
+        assert_eq!(
+            compiled.json["route"]["default_domain_resolver"],
+            "dns-iface-ethernet"
+        );
+
+        let outbounds = compiled.json["outbounds"].as_array().unwrap();
+        let eth_out = outbounds
+            .iter()
+            .find(|o| o["tag"] == "iface-ethernet")
+            .expect("iface-ethernet outbound");
+        assert_eq!(eth_out["bind_interface"], "Ethernet");
+        assert_eq!(eth_out["inet4_bind_address"], "192.168.42.50");
+
+        let dns_servers = compiled.json["dns"]["servers"].as_array().unwrap();
+        let eth_dns = dns_servers
+            .iter()
+            .find(|s| s["tag"] == "dns-iface-ethernet")
+            .expect("dns-iface-ethernet server");
+        assert_eq!(eth_dns["bind_interface"], "Ethernet");
+        assert_eq!(eth_dns["inet4_bind_address"], "192.168.42.50");
+
+        assert_passes_real_singbox_check(&compiled.json);
+    }
+
+    #[test]
+    fn test_invalid_or_local_ips_omitted_from_inet4_bind_address_and_karing_default_uses_root_dns() {
+        let graph = WorkflowGraph {
+            nodes: vec![
+                iface_node("if-lan1", "LAN 1", false),
+                vpn_node("vpn-karing", VpnProvider::Karing, true),
+            ],
+            edges: vec![edge("e1", "if-lan1", "vpn-karing")],
+        };
+
+        let mut interface_ipv4s = HashMap::new();
+        interface_ipv4s.insert("Wi-Fi".to_string(), "127.0.0.1".to_string());
+        interface_ipv4s.insert("LAN 1".to_string(), "169.254.1.2".to_string());
+
+        let mut vpn_runtime = HashMap::new();
+        vpn_runtime.insert(VpnProvider::Karing, karing_runtime(3067));
+
+        let compiled = compile_singbox_config(&CompileInput {
+            validated: validate_graph(&graph).expect("valid graph"),
+            default_physical_interface: "Wi-Fi".to_string(),
+            interface_ipv4s,
+            vpn_runtime,
+            clash_api_port: 9090,
+            log_path: PathBuf::from("sing-box.log"),
+        })
+        .expect("compile should succeed");
+
+        assert_eq!(compiled.json["route"]["final"], "vpn-karing");
+        assert_eq!(compiled.json["dns"]["final"], "dns-iface-lan-1");
+        assert_eq!(
+            compiled.json["route"]["default_domain_resolver"],
+            "dns-iface-lan-1"
+        );
+
+        let outbounds = compiled.json["outbounds"].as_array().unwrap();
+        let lan1_out = outbounds
+            .iter()
+            .find(|o| o["tag"] == "iface-lan-1")
+            .expect("iface-lan-1 outbound");
+        assert!(lan1_out.get("inet4_bind_address").is_none());
+
+        let dns_servers = compiled.json["dns"]["servers"].as_array().unwrap();
+        for srv in dns_servers {
+            assert!(srv.get("inet4_bind_address").is_none());
+        }
     }
 }

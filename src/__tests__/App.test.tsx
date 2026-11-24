@@ -13,6 +13,11 @@ const mockTauri = vi.hoisted(() => ({
   stopRouting: vi.fn(),
   getEngineStatus: vi.fn(),
   takeRecoveryNotice: vi.fn(),
+  getAppSettings: vi.fn(),
+  updateAppSettings: vi.fn(),
+  listAppGroups: vi.fn(),
+  saveAppGroup: vi.fn(),
+  deleteAppGroup: vi.fn(),
   onStatusChanged: vi.fn(),
   onTrafficUpdated: vi.fn(),
   onRecoveryNotice: vi.fn(),
@@ -59,6 +64,12 @@ describe("App", () => {
       lastError: null,
     });
     mockTauri.takeRecoveryNotice.mockResolvedValue(null);
+    mockTauri.getAppSettings.mockResolvedValue({
+      startWithWindows: false,
+      autoApplyLastWorkflow: false,
+      lastActiveWorkflowId: null,
+    });
+    mockTauri.listAppGroups.mockResolvedValue([]);
     mockTauri.onStatusChanged.mockResolvedValue(vi.fn());
     mockTauri.onTrafficUpdated.mockResolvedValue(vi.fn());
     mockTauri.onRecoveryNotice.mockResolvedValue(vi.fn());
@@ -86,6 +97,8 @@ describe("App", () => {
     await waitFor(() => {
       expect(mockTauri.getDiscoverySnapshot).toHaveBeenCalledTimes(1);
       expect(mockTauri.listWorkflows).toHaveBeenCalledTimes(1);
+      expect(mockTauri.getAppSettings).toHaveBeenCalledTimes(1);
+      expect(mockTauri.listAppGroups).toHaveBeenCalledTimes(1);
       expect(mockTauri.onStatusChanged).toHaveBeenCalledTimes(1);
       expect(mockTauri.onTrafficUpdated).toHaveBeenCalledTimes(1);
       expect(mockTauri.onRecoveryNotice).toHaveBeenCalledTimes(1);

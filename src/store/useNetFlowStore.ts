@@ -1,9 +1,12 @@
 import { create } from "zustand";
 import * as tauri from "../lib/tauri";
 import type {
+  AppSettings,
+  AppSettingsUpdate,
   DiscoverySnapshot,
   EngineStatus,
   LiveConnection,
+  SavedAppGroup,
   SavedWorkflow,
   SelectWorkflowResult,
   ValidationError,
@@ -19,11 +22,18 @@ const EMPTY_DISCOVERY: DiscoverySnapshot = {
   interfaces: [],
   vpns: [],
   processes: [],
+  openApps: [],
 };
 
 const EMPTY_GRAPH: WorkflowGraph = {
   nodes: [],
   edges: [],
+};
+
+const INITIAL_APP_SETTINGS: AppSettings = {
+  startWithWindows: false,
+  autoApplyLastWorkflow: false,
+  lastActiveWorkflowId: null,
 };
 
 const INITIAL_ENGINE_STATUS: EngineStatus = {
@@ -76,6 +86,11 @@ function upsertWorkflow(workflows: SavedWorkflow[], saved: SavedWorkflow): Saved
   return [saved, ...filtered].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
+function upsertSavedAppGroup(groups: SavedAppGroup[], saved: SavedAppGroup): SavedAppGroup[] {
+  const filtered = groups.filter((g) => g.id !== saved.id);
+  return [saved, ...filtered].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
 function isValidationErrorArray(err: unknown): err is ValidationError[] {
   return (
     Array.isArray(err) &&
@@ -107,6 +122,27 @@ export function isRoutingActiveState(state: EngineStatus["state"]): boolean {
   return state === "active" || state === "warning" || state === "applying";
 }
 
+export function serializeRoutingGraph(graph: WorkflowGraph): string {
+  const normalizedNodes = graph.nodes.map((node) => {
+    if (node.kind.type === "apps") {
+      return {
+        id: node.id,
+        kind: { type: "apps" as const, apps: node.kind.apps },
+      };
+    }
+    return {
+      id: node.id,
+      kind: node.kind,
+    };
+  });
+  const normalizedEdges = graph.edges.map((edge) => ({
+    id: edge.id,
+    source: edge.source,
+    target: edge.target,
+  }));
+  return JSON.stringify({ nodes: normalizedNodes, edges: normalizedEdges });
+}
+
 function clearOtherDefaults(nodes: WorkflowNode[], activeDefaultId: string): WorkflowNode[] {
   return nodes.map((node) => {
     if (node.id === activeDefaultId) {
@@ -124,6 +160,8 @@ function clearOtherDefaults(nodes: WorkflowNode[], activeDefaultId: string): Wor
 export interface NetFlowStoreState {
   discovery: DiscoverySnapshot;
   workflows: SavedWorkflow[];
+  savedAppGroups: SavedAppGroup[];
+  appSettings: AppSettings;
   currentWorkflowId: string | null;
   currentWorkflowName: string;
   graph: WorkflowGraph;
@@ -135,11 +173,22 @@ export interface NetFlowStoreState {
   recoveryNotice: string | null;
   uiError: string | null;
   isApplying: boolean;
+  appliedGraphSignature: string | null;
   selectedNodeId: string | null;
   fitViewRequestCount: number;
 
   refreshDiscovery: () => Promise<void>;
   loadWorkflows: () => Promise<void>;
+  loadAppSettings: () => Promise<void>;
+  updateAppSettings: (update: AppSettingsUpdate) => Promise<AppSettings | null>;
+  loadAppGroups: () => Promise<void>;
+  saveAppGroup: (input: {
+    id?: string;
+    name: string;
+    apps: string[];
+    iconDataUrl?: string | null;
+  }) => Promise<SavedAppGroup | null>;
+  deleteAppGroup: (id: string) => Promise<boolean>;
   selectWorkflow: (id: string, options?: { force?: boolean }) => SelectWorkflowResult;
   resetToBlankWorkflow: (options?: { force?: boolean }) => SelectWorkflowResult;
   createWorkflow: (name: string) => Promise<SavedWorkflow | null>;
@@ -160,6 +209,10 @@ export interface NetFlowStoreState {
   addNode: (node: WorkflowNode) => void;
   removeNode: (nodeId: string) => void;
   updateNodeApps: (nodeId: string, apps: string[]) => void;
+  updateNodeAppsMeta: (
+    nodeId: string,
+    meta: { label?: string | null; iconDataUrl?: string | null }
+  ) => void;
   updateVpnSettings: (nodeId: string, settings: Partial<VpnNodeSettings>) => void;
   setDefaultNode: (nodeId: string, isDefault?: boolean) => void;
 
@@ -228,6 +281,8 @@ function clearCanvasDraft(): void {
 export const useNetFlowStore = create<NetFlowStoreState>((set, get) => ({
   discovery: EMPTY_DISCOVERY,
   workflows: [],
+  savedAppGroups: [],
+  appSettings: { ...INITIAL_APP_SETTINGS },
   currentWorkflowId: null,
   currentWorkflowName: DEFAULT_WORKFLOW_NAME,
   graph: cloneGraph(EMPTY_GRAPH),
@@ -239,6 +294,7 @@ export const useNetFlowStore = create<NetFlowStoreState>((set, get) => ({
   recoveryNotice: null,
   uiError: null,
   isApplying: false,
+  appliedGraphSignature: null,
   selectedNodeId: null,
   fitViewRequestCount: 0,
 
@@ -248,6 +304,92 @@ export const useNetFlowStore = create<NetFlowStoreState>((set, get) => ({
       set({ discovery: snapshot, uiError: null });
     } catch (err) {
       set({ uiError: formatError(err) });
+    }
+  },
+
+  loadAppSettings: async () => {
+    try {
+      const settings = await tauri.getAppSettings?.();
+      if (settings && typeof settings.startWithWindows === "boolean") {
+        set({ appSettings: settings });
+      }
+    } catch {
+      // Safe no-op outside Tauri runtime
+    }
+  },
+
+  updateAppSettings: async (update) => {
+    try {
+      const updated = await tauri.updateAppSettings(update);
+      set({ appSettings: updated, uiError: null });
+      return updated;
+    } catch (err) {
+      set({ uiError: formatError(err) });
+      return null;
+    }
+  },
+
+  loadAppGroups: async () => {
+    try {
+      const groups = await tauri.listAppGroups?.();
+      if (Array.isArray(groups)) {
+        set({ savedAppGroups: groups });
+      }
+    } catch {
+      // Safe no-op outside Tauri runtime
+    }
+  },
+
+  saveAppGroup: async (input) => {
+    const trimmedName = input.name.trim();
+    if (!trimmedName) {
+      set({ uiError: "Group name cannot be empty." });
+      return null;
+    }
+    const normalizedApps = Array.from(
+      new Set(
+        input.apps
+          .map((app) => app.trim().toLowerCase())
+          .filter(Boolean)
+      )
+    );
+    if (normalizedApps.length === 0) {
+      set({ uiError: "Group must contain at least one executable." });
+      return null;
+    }
+
+    const payload: SavedAppGroup = {
+      id: input.id?.trim() ?? "",
+      name: trimmedName,
+      apps: normalizedApps,
+      iconDataUrl: input.iconDataUrl ?? null,
+      updatedAt: new Date().toISOString(),
+    };
+
+    try {
+      const saved = await tauri.saveAppGroup(payload);
+      set((state) => ({
+        savedAppGroups: upsertSavedAppGroup(state.savedAppGroups, saved),
+        uiError: null,
+      }));
+      return saved;
+    } catch (err) {
+      set({ uiError: formatError(err) });
+      return null;
+    }
+  },
+
+  deleteAppGroup: async (id) => {
+    try {
+      await tauri.deleteAppGroup(id);
+      set((state) => ({
+        savedAppGroups: state.savedAppGroups.filter((group) => group.id !== id),
+        uiError: null,
+      }));
+      return true;
+    } catch (err) {
+      set({ uiError: formatError(err) });
+      return false;
     }
   },
 
@@ -532,9 +674,16 @@ export const useNetFlowStore = create<NetFlowStoreState>((set, get) => ({
     }
 
     const { currentWorkflowId, graph } = get();
+    const graphSnapshot = cloneGraph(graph);
+    const signature = serializeRoutingGraph(graphSnapshot);
     try {
-      const status = await tauri.applyWorkflow(currentWorkflowId, graph);
-      set({ engineStatus: status, isApplying: false, uiError: null });
+      const status = await tauri.applyWorkflow(currentWorkflowId, graphSnapshot);
+      set({
+        engineStatus: status,
+        isApplying: false,
+        uiError: null,
+        appliedGraphSignature: isRoutingActiveState(status.state) ? signature : null,
+      });
       return true;
     } catch (err) {
       set({ isApplying: false, uiError: formatError(err) });
@@ -555,7 +704,7 @@ export const useNetFlowStore = create<NetFlowStoreState>((set, get) => ({
   stopRouting: async () => {
     try {
       const status = await tauri.stopRouting();
-      set({ engineStatus: status, uiError: null });
+      set({ engineStatus: status, appliedGraphSignature: null, uiError: null });
     } catch (err) {
       set({ uiError: formatError(err) });
     }
@@ -608,6 +757,36 @@ export const useNetFlowStore = create<NetFlowStoreState>((set, get) => ({
     }));
   },
 
+  updateNodeAppsMeta: (nodeId, meta) => {
+    set((state) => ({
+      graph: {
+        ...state.graph,
+        nodes: state.graph.nodes.map((node) => {
+          if (node.id !== nodeId || node.kind.type !== "apps") {
+            return node;
+          }
+          const nextKind = { ...node.kind };
+          if ("label" in meta) {
+            if (!meta.label) {
+              delete nextKind.label;
+            } else {
+              nextKind.label = meta.label;
+            }
+          }
+          if ("iconDataUrl" in meta) {
+            if (!meta.iconDataUrl) {
+              delete nextKind.iconDataUrl;
+            } else {
+              nextKind.iconDataUrl = meta.iconDataUrl;
+            }
+          }
+          return { ...node, kind: nextKind };
+        }),
+      },
+      isDirty: true,
+    }));
+  },
+
   updateVpnSettings: (nodeId, settings) => {
     set((state) => ({
       graph: {
@@ -629,12 +808,20 @@ export const useNetFlowStore = create<NetFlowStoreState>((set, get) => ({
   },
 
   setDefaultNode: (nodeId, explicitDefault) => {
+    if (get().isApplying) {
+      return;
+    }
+    let changed = false;
     set((state) => {
       const target = state.graph.nodes.find((n) => n.id === nodeId);
       if (!target || (target.kind.type !== "interface" && target.kind.type !== "vpn")) {
         return state;
       }
       const nextDefault = explicitDefault ?? !target.kind.isDefault;
+      if (nextDefault === target.kind.isDefault) {
+        return state;
+      }
+      changed = true;
       const updatedNodes = state.graph.nodes.map((node) => {
         if (node.kind.type !== "interface" && node.kind.type !== "vpn") {
           return node;
@@ -652,6 +839,10 @@ export const useNetFlowStore = create<NetFlowStoreState>((set, get) => ({
         isDirty: true,
       };
     });
+
+    if (changed && isRoutingActiveState(get().engineStatus.state)) {
+      void get().applyCurrentWorkflow();
+    }
   },
 
   setLiveConnections: (connections) => {
@@ -682,7 +873,13 @@ export const useNetFlowStore = create<NetFlowStoreState>((set, get) => ({
     const [unlistenStatus, unlistenTraffic, unlistenRecovery, initialStatus, notice] =
       await Promise.all([
         tauri.onStatusChanged((status) => {
-          set({ engineStatus: status });
+          set((state) => ({
+            engineStatus: status,
+            appliedGraphSignature:
+              status.state === "stopped" || status.state === "error"
+                ? null
+                : state.appliedGraphSignature,
+          }));
         }),
         tauri.onTrafficUpdated((connections) => {
           set({ liveConnections: connections });
@@ -725,6 +922,8 @@ export const useNetFlowStore = create<NetFlowStoreState>((set, get) => ({
     set({
       discovery: EMPTY_DISCOVERY,
       workflows: [],
+      savedAppGroups: [],
+      appSettings: { ...INITIAL_APP_SETTINGS },
       currentWorkflowId: null,
       currentWorkflowName: DEFAULT_WORKFLOW_NAME,
       graph: cloneGraph(EMPTY_GRAPH),
@@ -736,6 +935,7 @@ export const useNetFlowStore = create<NetFlowStoreState>((set, get) => ({
       recoveryNotice: null,
       uiError: null,
       isApplying: false,
+      appliedGraphSignature: null,
       selectedNodeId: null,
       fitViewRequestCount: 0,
     });

@@ -38,6 +38,10 @@ pub enum NodeKind {
     Apps {
         #[serde(default)]
         apps: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icon_data_url: Option<String>,
     },
 }
 

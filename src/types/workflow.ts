@@ -21,6 +21,8 @@ export type NodeKind =
   | {
       type: "apps";
       apps: string[];
+      label?: string | null;
+      iconDataUrl?: string | null;
     };
 
 export interface WorkflowNode {
@@ -93,10 +95,39 @@ export interface RunningProcessInfo {
   path: string | null;
 }
 
+export interface DetectedAppInfo {
+  id: string;
+  name: string;
+  primaryExe: string;
+  primaryPath: string | null;
+  executables: string[];
+  iconDataUrl: string | null;
+}
+
 export interface DiscoverySnapshot {
   interfaces: PhysicalInterfaceInfo[];
   vpns: DetectedVpnInfo[];
   processes: RunningProcessInfo[];
+  openApps?: DetectedAppInfo[];
+}
+
+export interface AppSettings {
+  startWithWindows: boolean;
+  autoApplyLastWorkflow: boolean;
+  lastActiveWorkflowId: string | null;
+}
+
+export interface AppSettingsUpdate {
+  startWithWindows?: boolean;
+  autoApplyLastWorkflow?: boolean;
+}
+
+export interface SavedAppGroup {
+  id: string;
+  name: string;
+  apps: string[];
+  iconDataUrl?: string | null;
+  updatedAt: string;
 }
 
 export interface LiveConnection {
@@ -108,6 +139,8 @@ export interface LiveConnection {
   nodeId: string | null;
   uploadBytes: number;
   downloadBytes: number;
+  uploadBytesPerSec?: number;
+  downloadBytesPerSec?: number;
 }
 
 export interface SelectWorkflowResult {

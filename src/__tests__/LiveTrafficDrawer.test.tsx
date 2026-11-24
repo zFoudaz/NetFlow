@@ -216,4 +216,89 @@ describe("LiveTrafficDrawer", () => {
     expect(screen.getByText("firefox.exe")).toBeTruthy();
     expect(screen.getByText("ssh.exe")).toBeTruthy();
   });
+
+  it("sorts live connections by Process name, Speed, and Up / Down bytes", async () => {
+    const user = userEvent.setup();
+    useNetFlowStore.setState({
+      isTrafficDrawerOpen: true,
+      graph: sampleGraph,
+      liveConnections: [
+        {
+          id: "c-mid",
+          processName: "discord.exe",
+          destination: "gateway.discord.gg:443",
+          network: "tcp",
+          outboundTag: "vpn-karing",
+          nodeId: "vpn-karing",
+          uploadBytes: 1000,
+          downloadBytes: 2000,
+          uploadBytesPerSec: 1024,
+          downloadBytesPerSec: 2048,
+        },
+        {
+          id: "c-fast",
+          processName: "steam.exe",
+          destination: "cdn.steam.com:443",
+          network: "tcp",
+          outboundTag: "iface-wi-fi",
+          nodeId: "if-wifi",
+          uploadBytes: 500,
+          downloadBytes: 500,
+          uploadBytesPerSec: 0,
+          downloadBytesPerSec: 2 * 1024 * 1024,
+        },
+        {
+          id: "c-heavy",
+          processName: "aria2c.exe",
+          destination: "mirror.org:443",
+          network: "tcp",
+          outboundTag: "iface-wi-fi",
+          nodeId: "if-wifi",
+          uploadBytes: 10 * 1024 * 1024,
+          downloadBytes: 20 * 1024 * 1024,
+          uploadBytesPerSec: 100,
+          downloadBytesPerSec: 200,
+        },
+      ],
+    });
+
+    const { container } = render(<LiveTrafficDrawer />);
+
+    const getRowProcesses = () =>
+      Array.from(container.querySelectorAll("tbody tr")).map(
+        (tr) => tr.querySelector("td")?.textContent ?? ""
+      );
+
+    expect(screen.getByText("2.0 MB/s")).toBeTruthy();
+    expect(screen.getByText("3.0 KB/s")).toBeTruthy();
+
+    // Click Process header -> ascending alphabetical
+    await user.click(screen.getByRole("button", { name: /^Process$/i }));
+    expect(getRowProcesses()).toEqual(["aria2c.exe", "discord.exe", "steam.exe"]);
+    expect(
+      screen.getByRole("columnheader", { name: /^Process$/i }).getAttribute("aria-sort")
+    ).toBe("ascending");
+
+    // Click Process header again -> descending alphabetical
+    await user.click(screen.getByRole("button", { name: /^Process$/i }));
+    expect(getRowProcesses()).toEqual(["steam.exe", "discord.exe", "aria2c.exe"]);
+    expect(
+      screen.getByRole("columnheader", { name: /^Process$/i }).getAttribute("aria-sort")
+    ).toBe("descending");
+
+    // Click Speed header -> defaults to descending (fastest first)
+    await user.click(screen.getByRole("button", { name: /^Speed$/i }));
+    expect(getRowProcesses()).toEqual(["steam.exe", "discord.exe", "aria2c.exe"]);
+    expect(
+      screen.getByRole("columnheader", { name: /^Speed$/i }).getAttribute("aria-sort")
+    ).toBe("descending");
+
+    // Click Speed header again -> ascending (slowest first)
+    await user.click(screen.getByRole("button", { name: /^Speed$/i }));
+    expect(getRowProcesses()).toEqual(["aria2c.exe", "discord.exe", "steam.exe"]);
+
+    // Click Up / Down header -> defaults to descending (largest total bytes first)
+    await user.click(screen.getByRole("button", { name: /^Up \/ Down$/i }));
+    expect(getRowProcesses()).toEqual(["aria2c.exe", "discord.exe", "steam.exe"]);
+  });
 });

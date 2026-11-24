@@ -4,11 +4,14 @@
 //! Intentionally free of any `tauri` dependency so it can be tested headlessly and
 //! reused across targets.
 
+pub mod app_groups;
+pub mod autostart;
 pub mod compiler;
 pub mod discovery;
 pub mod model;
 pub mod recovery;
 pub mod runtime;
+pub mod settings;
 pub mod storage;
 pub mod traffic;
 pub mod validator;

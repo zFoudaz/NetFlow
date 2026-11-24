@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DiscoverySnapshot, EngineStatus, WorkflowGraph } from "../types/workflow";
@@ -15,6 +15,11 @@ const mockTauri = vi.hoisted(() => ({
   stopRouting: vi.fn(),
   getEngineStatus: vi.fn(),
   takeRecoveryNotice: vi.fn(),
+  getAppSettings: vi.fn(),
+  updateAppSettings: vi.fn(),
+  listAppGroups: vi.fn(),
+  saveAppGroup: vi.fn(),
+  deleteAppGroup: vi.fn(),
   onStatusChanged: vi.fn(),
   onTrafficUpdated: vi.fn(),
   onRecoveryNotice: vi.fn(),
@@ -761,6 +766,209 @@ describe("FlowCanvas, Sidebar, and Custom Nodes", () => {
     expect(useNetFlowStore.getState().graph.nodes[0].kind).toEqual({
       type: "apps",
       apps: ["chrome.exe"],
+    });
+  });
+
+  it("keeps selection on newly dropped interface and toggles default directly from node cards when stopped or active", async () => {
+    const user = userEvent.setup();
+    useNetFlowStore.setState({
+      graph: {
+        nodes: [
+          {
+            id: "iface-wifi",
+            x: 60,
+            y: 100,
+            kind: { type: "interface", interfaceAlias: "Wi-Fi", isDefault: true },
+          },
+        ],
+        edges: [],
+      },
+      selectedNodeId: "iface-wifi",
+    });
+
+    render(
+      <>
+        <FlowCanvas />
+        <PropertiesPanel />
+      </>
+    );
+
+    // Drop Ethernet onto canvas while Wi-Fi is selected -> selection must stay on Ethernet
+    const canvasWrapper = screen.getByTestId("flow-canvas-dropzone");
+    fireEvent.drop(canvasWrapper, {
+      clientX: 250,
+      clientY: 260,
+      dataTransfer: {
+        getData: (mime: string) =>
+          mime === "application/netflow-node"
+            ? JSON.stringify({ type: "interface", interfaceAlias: "Ethernet" })
+            : "",
+      },
+    });
+
+    const ethNodeModel = useNetFlowStore
+      .getState()
+      .graph.nodes.find((n) => n.kind.type === "interface" && n.kind.interfaceAlias === "Ethernet");
+    expect(ethNodeModel).toBeTruthy();
+    await waitFor(() => {
+      expect(useNetFlowStore.getState().selectedNodeId).toBe(ethNodeModel!.id);
+    });
+
+    // Inspector should reflect Ethernet, and clicking Set as Default makes Ethernet default
+    const inspector = screen.getByLabelText("Node Properties");
+    expect(within(inspector).getByText("Ethernet")).toBeTruthy();
+    await user.click(within(inspector).getByRole("button", { name: /Set as Default/i }));
+    expect(
+      useNetFlowStore.getState().graph.nodes.find((n) => n.id === ethNodeModel!.id)?.kind
+    ).toMatchObject({ isDefault: true });
+    expect(
+      useNetFlowStore.getState().graph.nodes.find((n) => n.id === "iface-wifi")?.kind
+    ).toMatchObject({ isDefault: false });
+    expect(mockTauri.applyWorkflow).not.toHaveBeenCalled();
+
+    // Now switch to active routing and toggle default back to Wi-Fi directly from the InterfaceNode card
+    mockTauri.validateWorkflowGraph.mockResolvedValue(null);
+    mockTauri.applyWorkflow.mockResolvedValue({
+      state: "active",
+      activeWorkflowId: null,
+      nodeHealth: {},
+      warningBanner: null,
+      lastError: null,
+    });
+    useNetFlowStore.setState({
+      engineStatus: {
+        state: "active",
+        activeWorkflowId: null,
+        nodeHealth: {},
+        warningBanner: null,
+        lastError: null,
+      },
+    });
+
+    const wifiCard = await screen.findByTestId("flow-node-iface-wifi");
+    await user.click(within(wifiCard).getByRole("button", { name: /Set Wi-Fi as default/i }));
+
+    await waitFor(() => {
+      expect(mockTauri.applyWorkflow).toHaveBeenCalledTimes(1);
+    });
+    expect(
+      useNetFlowStore.getState().graph.nodes.find((n) => n.id === "iface-wifi")?.kind
+    ).toMatchObject({ isDefault: true });
+    expect(
+      useNetFlowStore.getState().graph.nodes.find((n) => n.id === ethNodeModel!.id)?.kind
+    ).toMatchObject({ isDefault: false });
+  });
+
+  it("renders Running Apps in Sidebar with icons, filters, drags onto canvas with name/exes, and supports Saved Groups", async () => {
+    const user = userEvent.setup();
+    const iconUrl =
+      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+
+    mockTauri.deleteAppGroup.mockResolvedValue(null);
+    useNetFlowStore.setState({
+      discovery: {
+        ...sampleDiscovery,
+        openApps: [
+          {
+            id: "app-discord",
+            name: "Discord",
+            primaryExe: "discord.exe",
+            primaryPath: "C:\\Users\\Test\\AppData\\Local\\Discord\\app\\Discord.exe",
+            executables: ["discord.exe", "update.exe"],
+            iconDataUrl: iconUrl,
+          },
+          {
+            id: "app-chrome",
+            name: "Google Chrome",
+            primaryExe: "chrome.exe",
+            primaryPath: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+            executables: ["chrome.exe"],
+            iconDataUrl: null,
+          },
+        ],
+      },
+      savedAppGroups: [
+        {
+          id: "grp-browsers",
+          name: "Browsers",
+          apps: ["chrome.exe", "firefox.exe"],
+          iconDataUrl: null,
+          updatedAt: "2026-11-24T12:00:00Z",
+        },
+      ],
+    });
+
+    const { container } = render(
+      <>
+        <Sidebar />
+        <FlowCanvas />
+      </>
+    );
+
+    const discordRow = screen.getByTestId("sidebar-open-app-app-discord");
+    expect(within(discordRow).getByText("Discord")).toBeTruthy();
+    expect(within(discordRow).getByText("discord.exe +1")).toBeTruthy();
+    expect(discordRow.querySelector("img")?.getAttribute("src")).toBe(iconUrl);
+
+    // Filter Running Apps by executable or display name
+    const filterInput = screen.getByLabelText("Filter running apps");
+    await user.type(filterInput, "discord");
+    expect(screen.queryByTestId("sidebar-open-app-app-chrome")).toBeNull();
+    expect(screen.getByTestId("sidebar-open-app-app-discord")).toBeTruthy();
+    await user.clear(filterInput);
+
+    // Quick-add Discord creates a named & iconed AppsNode on canvas with grouped executables
+    await user.click(within(discordRow).getByRole("button", { name: /Add Discord app/i }));
+    const createdNode = useNetFlowStore
+      .getState()
+      .graph.nodes.find((n) => n.kind.type === "apps" && n.kind.label === "Discord");
+    expect(createdNode).toBeTruthy();
+    expect(createdNode?.kind).toEqual({
+      type: "apps",
+      label: "Discord",
+      apps: ["discord.exe", "update.exe"],
+      iconDataUrl: iconUrl,
+    });
+    expect(within(discordRow).getByText("On Canvas")).toBeTruthy();
+    expect(discordRow.getAttribute("draggable")).toBe("false");
+
+    const canvasCard = await screen.findByTestId(`flow-node-${createdNode!.id}`);
+    expect(within(canvasCard).getByText("Discord")).toBeTruthy();
+    expect(within(canvasCard).getByText("update.exe")).toBeTruthy();
+    expect(canvasCard.querySelector("img")?.getAttribute("src")).toBe(iconUrl);
+
+    // Drag & drop Saved Group onto canvas
+    const canvasDropzone = screen.getByTestId("flow-canvas-dropzone");
+    fireEvent.drop(canvasDropzone, {
+      clientX: 480,
+      clientY: 260,
+      dataTransfer: {
+        getData: (mime: string) =>
+          mime === "application/netflow-node"
+            ? JSON.stringify({
+                type: "apps",
+                label: "Browsers",
+                apps: ["chrome.exe", "firefox.exe"],
+                iconDataUrl: null,
+              })
+            : "",
+      },
+    });
+    const droppedGroup = useNetFlowStore
+      .getState()
+      .graph.nodes.find((n) => n.kind.type === "apps" && n.kind.label === "Browsers");
+    expect(droppedGroup?.kind).toEqual({
+      type: "apps",
+      label: "Browsers",
+      apps: ["chrome.exe", "firefox.exe"],
+    });
+
+    // Delete Saved Group from Sidebar
+    const savedRow = screen.getByTestId("sidebar-saved-group-grp-browsers");
+    await user.click(within(savedRow).getByRole("button", { name: /Delete Browsers group/i }));
+    expect(mockTauri.deleteAppGroup).toHaveBeenCalledWith("grp-browsers");
+    await waitFor(() => {
+      expect(container.querySelector('[data-testid="sidebar-saved-group-grp-browsers"]')).toBeNull();
     });
   });
 });

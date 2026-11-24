@@ -1,5 +1,5 @@
 import { Handle, Position, type Node, type NodeProps } from "@xyflow/react";
-import { Settings2, Shield, Trash2 } from "lucide-react";
+import { Settings2, Shield, Star, Trash2 } from "lucide-react";
 import { useNetFlowStore } from "../../store/useNetFlowStore";
 import type { WorkflowNode } from "../../types/workflow";
 import {
@@ -16,7 +16,9 @@ export function VpnNode({ data, selected }: NodeProps<VpnFlowNode>) {
   const discoveryVpns = useNetFlowStore((s) => s.discovery.vpns);
   const graph = useNetFlowStore((s) => s.graph);
   const selectedNodeId = useNetFlowStore((s) => s.selectedNodeId);
+  const isApplying = useNetFlowStore((s) => s.isApplying);
   const setSelectedNodeId = useNetFlowStore((s) => s.setSelectedNodeId);
+  const setDefaultNode = useNetFlowStore((s) => s.setDefaultNode);
   const removeNode = useNetFlowStore((s) => s.removeNode);
   const { nodeErrors, isDropped, hasIssue, errorTooltip } = useNodeDiagnostics(wfNode.id);
 
@@ -75,11 +77,6 @@ export function VpnNode({ data, selected }: NodeProps<VpnFlowNode>) {
               <span className="truncate text-[13px] font-semibold text-[#F3F4F6]">
                 {providerLabel}
               </span>
-              {isDefault && (
-                <span className="shrink-0 rounded border border-[#3ECF8E]/30 bg-[#3ECF8E]/10 px-1 py-0.2 text-[9px] font-semibold uppercase tracking-wide text-[#3ECF8E]">
-                  Default
-                </span>
-              )}
             </div>
             <div className="mt-0.5 flex items-center gap-1.5 text-[11px]">
               <span
@@ -132,6 +129,32 @@ export function VpnNode({ data, selected }: NodeProps<VpnFlowNode>) {
         <span className="shrink-0 font-mono text-[10px] text-[#6B7280]">
           {endpointDetail}
         </span>
+      </div>
+
+      <div className="nodrag mt-2 flex items-center justify-between border-t border-[#232830] pt-2">
+        <button
+          type="button"
+          disabled={isApplying}
+          aria-pressed={isDefault}
+          aria-label={
+            isDefault
+              ? `Clear default on ${providerLabel}`
+              : `Set ${providerLabel} as default`
+          }
+          onClick={(e) => {
+            e.stopPropagation();
+            setSelectedNodeId(wfNode.id);
+            setDefaultNode(wfNode.id);
+          }}
+          className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide transition disabled:cursor-not-allowed disabled:opacity-50 ${
+            isDefault
+              ? "border-[#3ECF8E]/40 bg-[#3ECF8E]/10 text-[#3ECF8E]"
+              : "border-[#232830] bg-[#111418] text-[#9CA3AF] hover:border-[#2E3540] hover:text-[#F3F4F6]"
+          }`}
+        >
+          <Star className={`h-2.5 w-2.5 ${isDefault ? "fill-[#3ECF8E] text-[#3ECF8E]" : ""}`} />
+          <span>{isDefault ? "Default" : "Set Default"}</span>
+        </button>
       </div>
 
       <NodeErrorCallout errors={nodeErrors} tooltip={errorTooltip} />

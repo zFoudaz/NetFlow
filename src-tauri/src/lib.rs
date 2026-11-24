@@ -2,13 +2,17 @@
 
 pub mod commands;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use netflow_core::app_groups::{default_app_groups_path, AppGroupStore};
+use netflow_core::autostart::{AutoStartManager, WindowsTaskSchedulerAutoStart};
 use netflow_core::discovery::{SystemDiscovery, Win32Discovery};
 use netflow_core::recovery::{default_recovery_path, RecoveryStore};
 use netflow_core::runtime::{
     EngineRuntime, EngineRuntimeConfig, RuntimeEvent, SidecarRunner, SingBoxSidecar,
 };
+use netflow_core::settings::{default_settings_path, SettingsStore};
 use netflow_core::storage::{default_workflows_dir, WorkflowStore};
 use netflow_core::win_net::{Win32NetworkOps, WindowsNetworkOps};
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
@@ -18,8 +22,8 @@ use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::commands::{
-    resolve_sidecar_paths, run_startup_recovery, AppState, EVENT_RECOVERY_NOTICE, EVENT_STATUS,
-    EVENT_TRAFFIC,
+    is_autostart_launch, resolve_sidecar_paths, run_startup_recovery, AppState,
+    EVENT_RECOVERY_NOTICE, EVENT_STATUS, EVENT_TRAFFIC,
 };
 
 const TRAY_ID: &str = "netflow-tray";
@@ -163,16 +167,43 @@ pub fn run() {
                 EngineRuntimeConfig::default(),
             ));
             let workflow_store = WorkflowStore::new(default_workflows_dir());
-            let app_state = AppState::new(Arc::clone(&runtime), workflow_store, discovery);
+            let settings_store = SettingsStore::new(default_settings_path());
+            let app_group_store = AppGroupStore::new(default_app_groups_path());
+            let auto_start: Arc<dyn AutoStartManager> =
+                Arc::new(WindowsTaskSchedulerAutoStart::default());
+            let exe_path =
+                std::env::current_exe().unwrap_or_else(|_| PathBuf::from("NetFlow.exe"));
+            let app_state = AppState::new(
+                Arc::clone(&runtime),
+                workflow_store,
+                settings_store,
+                app_group_store,
+                auto_start,
+                exe_path,
+                discovery,
+            );
 
             let mut event_rx = runtime.subscribe_events();
             if let Some(notice) = run_startup_recovery(&app_state, &mut event_rx) {
                 let _ = app.emit(EVENT_RECOVERY_NOTICE, notice);
             }
 
+            let autostart_launch = is_autostart_launch(std::env::args());
+
             app.manage(app_state);
             spawn_event_forwarder(app.handle().clone(), runtime, event_rx);
             build_system_tray(app)?;
+
+            if autostart_launch {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Some(state) = app_handle.try_state::<AppState>() {
+                        let _ = state.run_autostart_workflow_if_enabled().await;
+                    }
+                });
+            } else {
+                show_main_window(app.handle());
+            }
 
             Ok(())
         })
@@ -198,6 +229,11 @@ pub fn run() {
             commands::stop_routing,
             commands::get_engine_status,
             commands::take_recovery_notice,
+            commands::get_app_settings,
+            commands::update_app_settings,
+            commands::list_app_groups,
+            commands::save_app_group,
+            commands::delete_app_group,
         ])
         .build(tauri::generate_context!())
         .expect("error while building NetFlow Tauri application");

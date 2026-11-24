@@ -13,12 +13,17 @@ import {
   Play,
   RefreshCw,
   Save,
+  Settings,
   ShieldAlert,
   Square,
   Trash2,
   X,
 } from "lucide-react";
-import { isRoutingActiveState, useNetFlowStore } from "../store/useNetFlowStore";
+import {
+  isRoutingActiveState,
+  serializeRoutingGraph,
+  useNetFlowStore,
+} from "../store/useNetFlowStore";
 import type { RuntimeState } from "../types/workflow";
 
 type PromptMode =
@@ -67,13 +72,16 @@ export function TopBar() {
   const workflows = useNetFlowStore((s) => s.workflows);
   const currentWorkflowId = useNetFlowStore((s) => s.currentWorkflowId);
   const currentWorkflowName = useNetFlowStore((s) => s.currentWorkflowName);
+  const graph = useNetFlowStore((s) => s.graph);
   const isDirty = useNetFlowStore((s) => s.isDirty);
   const engineStatus = useNetFlowStore((s) => s.engineStatus);
   const isApplying = useNetFlowStore((s) => s.isApplying);
+  const appliedGraphSignature = useNetFlowStore((s) => s.appliedGraphSignature);
   const recoveryNotice = useNetFlowStore((s) => s.recoveryNotice);
   const uiError = useNetFlowStore((s) => s.uiError);
   const isTrafficDrawerOpen = useNetFlowStore((s) => s.isTrafficDrawerOpen);
   const liveConnections = useNetFlowStore((s) => s.liveConnections);
+  const appSettings = useNetFlowStore((s) => s.appSettings);
 
   const selectWorkflow = useNetFlowStore((s) => s.selectWorkflow);
   const createWorkflow = useNetFlowStore((s) => s.createWorkflow);
@@ -87,18 +95,37 @@ export function TopBar() {
   const validateCurrentGraph = useNetFlowStore((s) => s.validateCurrentGraph);
   const requestFitView = useNetFlowStore((s) => s.requestFitView);
   const toggleTrafficDrawer = useNetFlowStore((s) => s.toggleTrafficDrawer);
+  const updateAppSettings = useNetFlowStore((s) => s.updateAppSettings);
   const dismissRecoveryNotice = useNetFlowStore((s) => s.dismissRecoveryNotice);
   const clearUiError = useNetFlowStore((s) => s.clearUiError);
 
   const [menuOpen, setMenuOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [isUpdatingSettings, setIsUpdatingSettings] = useState(false);
   const [promptMode, setPromptMode] = useState<PromptMode>(null);
   const [nameInput, setNameInput] = useState("");
   const [pendingDiscard, setPendingDiscard] = useState<PendingDiscard>(null);
   const [validatedOk, setValidatedOk] = useState(false);
 
+  const handleToggleSetting = async (
+    key: "startWithWindows" | "autoApplyLastWorkflow",
+    nextValue: boolean
+  ) => {
+    setIsUpdatingSettings(true);
+    try {
+      await updateAppSettings({ [key]: nextValue });
+    } finally {
+      setIsUpdatingSettings(false);
+    }
+  };
+
   const routingActive = isRoutingActiveState(engineStatus.state);
   const statusMeta = STATUS_META[engineStatus.state];
   const applyingNow = isApplying || engineStatus.state === "applying";
+  const hasUnappliedChanges =
+    routingActive &&
+    appliedGraphSignature !== null &&
+    serializeRoutingGraph(graph) !== appliedGraphSignature;
   const droppedCount = Object.values(engineStatus.nodeHealth).filter(
     (h) => h === "dropped"
   ).length;
@@ -193,7 +220,10 @@ export function TopBar() {
           <div className="relative">
             <button
               type="button"
-              onClick={() => setMenuOpen((prev) => !prev)}
+              onClick={() => {
+                setMenuOpen((prev) => !prev);
+                setSettingsOpen(false);
+              }}
               aria-expanded={menuOpen}
               aria-label="Workflow Switcher"
               className="inline-flex h-8 items-center gap-2 rounded-md border border-[#232830] bg-[#161A20] px-2.5 text-xs font-medium text-[#F3F4F6] transition hover:border-[#2E3540] hover:bg-[#1D222B]"
@@ -393,11 +423,143 @@ export function TopBar() {
             type="button"
             disabled={applyingNow}
             onClick={() => void applyCurrentWorkflow()}
-            className="inline-flex h-8 items-center gap-1.5 rounded-md bg-[#3ECF8E] px-3.5 text-xs font-semibold text-[#0B0D10] transition hover:bg-[#34B87E] disabled:cursor-not-allowed disabled:opacity-50"
+            className={`inline-flex h-8 items-center gap-1.5 rounded-md px-3.5 text-xs font-semibold text-[#0B0D10] transition disabled:cursor-not-allowed disabled:opacity-50 ${
+              hasUnappliedChanges && !applyingNow
+                ? "bg-amber-400 hover:bg-amber-300"
+                : "bg-[#3ECF8E] hover:bg-[#34B87E]"
+            }`}
           >
             <Play className="h-3.5 w-3.5 fill-current" />
-            <span>{applyingNow ? "Applying..." : "Start / Apply"}</span>
+            <span>
+              {applyingNow
+                ? "Applying..."
+                : hasUnappliedChanges
+                  ? "Apply Changes"
+                  : "Start / Apply"}
+            </span>
           </button>
+
+          <div className="relative">
+            <button
+              type="button"
+              aria-label="Settings"
+              aria-expanded={settingsOpen}
+              title="Settings"
+              onClick={() => {
+                setSettingsOpen((prev) => !prev);
+                setMenuOpen(false);
+              }}
+              className={`inline-flex h-8 w-8 items-center justify-center rounded-md border transition ${
+                settingsOpen
+                  ? "border-[#3ECF8E]/50 bg-[#1D222B] text-[#3ECF8E]"
+                  : "border-[#232830] bg-[#161A20] text-[#9CA3AF] hover:border-[#2E3540] hover:bg-[#1D222B] hover:text-[#F3F4F6]"
+              }`}
+            >
+              <Settings className="h-3.5 w-3.5" />
+            </button>
+
+            {settingsOpen && (
+              <div
+                role="dialog"
+                aria-label="Application Settings"
+                className="absolute right-0 mt-1.5 w-80 rounded-md border border-[#2E3540] bg-[#111418] p-3 shadow-lg shadow-black/40"
+              >
+                <div className="mb-2.5 flex items-center justify-between">
+                  <span className="text-[11px] font-semibold uppercase tracking-wider text-[#9CA3AF]">
+                    Settings
+                  </span>
+                  <button
+                    type="button"
+                    aria-label="Close settings"
+                    onClick={() => setSettingsOpen(false)}
+                    className="rounded p-0.5 text-[#6B7280] hover:text-[#F3F4F6]"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+
+                <div className="space-y-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <div className="text-xs font-medium text-[#F3F4F6]">
+                        Start with Windows
+                      </div>
+                      <div className="text-[11px] text-[#6B7280]">
+                        Launch minimized in the system tray at sign-in
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-label="Start with Windows"
+                      aria-checked={appSettings.startWithWindows}
+                      disabled={isUpdatingSettings}
+                      onClick={() =>
+                        void handleToggleSetting(
+                          "startWithWindows",
+                          !appSettings.startWithWindows
+                        )
+                      }
+                      className={`relative mt-0.5 inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                        appSettings.startWithWindows
+                          ? "border-[#3ECF8E] bg-[#3ECF8E]/30"
+                          : "border-[#2E3540] bg-[#161A20]"
+                      }`}
+                    >
+                      <span
+                        className={`inline-block h-3.5 w-3.5 transform rounded-full transition ${
+                          appSettings.startWithWindows
+                            ? "translate-x-4 bg-[#3ECF8E]"
+                            : "translate-x-0.5 bg-[#6B7280]"
+                        }`}
+                      />
+                    </button>
+                  </div>
+
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <div className="text-xs font-medium text-[#F3F4F6]">
+                        Auto-apply last workflow
+                      </div>
+                      <div className="text-[11px] text-[#6B7280]">
+                        Restore routing automatically when launched at startup
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-label="Auto-apply last workflow"
+                      aria-checked={appSettings.autoApplyLastWorkflow}
+                      disabled={isUpdatingSettings}
+                      onClick={() =>
+                        void handleToggleSetting(
+                          "autoApplyLastWorkflow",
+                          !appSettings.autoApplyLastWorkflow
+                        )
+                      }
+                      className={`relative mt-0.5 inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                        appSettings.autoApplyLastWorkflow
+                          ? "border-[#3ECF8E] bg-[#3ECF8E]/30"
+                          : "border-[#2E3540] bg-[#161A20]"
+                      }`}
+                    >
+                      <span
+                        className={`inline-block h-3.5 w-3.5 transform rounded-full transition ${
+                          appSettings.autoApplyLastWorkflow
+                            ? "translate-x-4 bg-[#3ECF8E]"
+                            : "translate-x-0.5 bg-[#6B7280]"
+                        }`}
+                      />
+                    </button>
+                  </div>
+                </div>
+
+                <div className="mt-3 border-t border-[#232830] pt-2.5 text-[11px] leading-relaxed text-[#6B7280]">
+                  Closing the window (X) minimizes NetFlow to the System Tray. Exit from the tray icon menu.
+                </div>
+              </div>
+            )}
+          </div>
         </div>
       </div>
 

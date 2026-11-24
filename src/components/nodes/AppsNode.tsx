@@ -25,7 +25,8 @@ export function AppsNode({ data, selected }: NodeProps<AppsFlowNode>) {
     return null;
   }
 
-  const { apps } = wfNode.kind;
+  const { apps, label, iconDataUrl } = wfNode.kind;
+  const title = label?.trim() || "Connected Apps";
   const isSelected = Boolean(selected) || selectedNodeId === wfNode.id;
 
   const handleAddApp = (exeName: string) => {
@@ -59,10 +60,18 @@ export function AppsNode({ data, selected }: NodeProps<AppsFlowNode>) {
 
       <div className="flex items-start justify-between gap-2">
         <div className="flex min-w-0 items-center gap-2.5">
-          <AppWindow className="h-4 w-4 shrink-0 text-[#3ECF8E]" />
+          {iconDataUrl ? (
+            <img
+              src={iconDataUrl}
+              alt=""
+              className="h-4 w-4 shrink-0 rounded-sm object-contain"
+            />
+          ) : (
+            <AppWindow className="h-4 w-4 shrink-0 text-[#3ECF8E]" />
+          )}
           <div className="min-w-0">
             <div className="truncate text-[13px] font-semibold text-[#F3F4F6]">
-              Connected Apps
+              {title}
             </div>
             <div className="mt-0.5 flex items-center gap-1.5 text-[11px] text-[#9CA3AF]">
               <span>
@@ -79,7 +88,7 @@ export function AppsNode({ data, selected }: NodeProps<AppsFlowNode>) {
 
         <button
           type="button"
-          aria-label="Delete Connected Apps node"
+          aria-label={`Delete ${title} node`}
           onClick={(e) => {
             e.stopPropagation();
             removeNode(wfNode.id);

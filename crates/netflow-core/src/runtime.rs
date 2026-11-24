@@ -666,11 +666,24 @@ impl EngineRuntime {
     ) -> Result<EngineStatus, RuntimeError> {
         let _op_guard = self.op_lock.lock().await;
 
+        let prior_metric_snapshots = {
+            let inner = self.inner.lock().expect("engine status mutex poisoned");
+            inner
+                .active_session
+                .as_ref()
+                .map(|s| s.recovery.physical_metric_snapshots.clone())
+                .unwrap_or_default()
+        };
+
         let prepared = {
             let discovery = Arc::clone(&self.discovery);
             let config = self.config.clone();
             let graph = graph.clone();
-            match run_blocking(move || prepare_apply_blocking(&*discovery, &config, &graph)).await {
+            match run_blocking(move || {
+                prepare_apply_blocking(&*discovery, &config, &graph, &prior_metric_snapshots)
+            })
+            .await
+            {
                 Ok(plan) => plan,
                 Err(err) => {
                     let is_active = {
@@ -1270,10 +1283,40 @@ where
     }
 }
 
+fn pick_default_physical_interface(
+    interfaces: &[PhysicalInterfaceInfo],
+    prior_metric_snapshots: &[InterfaceMetricSnapshot],
+) -> Option<String> {
+    if !prior_metric_snapshots.is_empty() {
+        let orig_by_if: HashMap<u32, u32> = prior_metric_snapshots
+            .iter()
+            .filter(|s| !s.is_ipv6)
+            .map(|s| (s.interface_index, s.original_metric))
+            .collect();
+
+        if let Some(best_prior) = interfaces
+            .iter()
+            .filter(|i| i.is_up && i.gateway_ipv4.is_some())
+            .filter_map(|i| orig_by_if.get(&i.if_index).map(|m| (*m, i.if_index, &i.alias)))
+            .min_by_key(|(m, idx, _)| (*m, *idx))
+            .map(|(_, _, alias)| alias.clone())
+        {
+            return Some(best_prior);
+        }
+    }
+
+    interfaces
+        .iter()
+        .find(|i| i.is_up && i.is_default_gateway)
+        .or_else(|| interfaces.iter().find(|i| i.is_up))
+        .map(|i| i.alias.clone())
+}
+
 fn prepare_apply_blocking(
     discovery: &dyn SystemDiscovery,
     config: &EngineRuntimeConfig,
     graph: &WorkflowGraph,
+    prior_metric_snapshots: &[InterfaceMetricSnapshot],
 ) -> Result<PreparedApply, RuntimeError> {
     let validated = validate_graph(graph).map_err(RuntimeError::Validation)?;
     let discovery_snap = discovery.snapshot()?;
@@ -1296,13 +1339,15 @@ fn prepare_apply_blocking(
         }
     }
 
-    let default_physical_interface = discovery_snap
+    let default_physical_interface =
+        pick_default_physical_interface(&discovery_snap.interfaces, prior_metric_snapshots)
+            .ok_or(RuntimeError::NoDefaultPhysicalInterface)?;
+
+    let interface_ipv4s: HashMap<String, String> = discovery_snap
         .interfaces
         .iter()
-        .find(|i| i.is_up && i.is_default_gateway)
-        .or_else(|| discovery_snap.interfaces.iter().find(|i| i.is_up))
-        .map(|i| i.alias.clone())
-        .ok_or(RuntimeError::NoDefaultPhysicalInterface)?;
+        .filter_map(|i| i.ipv4.as_ref().map(|ip| (i.alias.clone(), ip.clone())))
+        .collect();
 
     let mut vpn_runtime = HashMap::new();
 
@@ -1323,6 +1368,7 @@ fn prepare_apply_blocking(
     let compiled = compile_singbox_config(&CompileInput {
         validated: validated.clone(),
         default_physical_interface: default_physical_interface.clone(),
+        interface_ipv4s,
         vpn_runtime: vpn_runtime.clone(),
         clash_api_port,
         log_path: config.runtime_dir.join("sing-box.log"),
@@ -1396,6 +1442,8 @@ fn reconcile_hot_switch_removals_blocking(
     new_providers: &HashSet<VpnProvider>,
     snapshot: &mut RecoverySnapshot,
 ) -> Result<(), RuntimeError> {
+    net_ops.disable_system_proxy()?;
+
     if !snapshot.pinned_host_routes.is_empty() {
         while let Some(route) = snapshot.pinned_host_routes.last().cloned() {
             remove_route_ignore_missing(net_ops, &route)?;
@@ -1906,6 +1954,8 @@ mod tests {
             y: 0.0,
             kind: NodeKind::Apps {
                 apps: apps.iter().map(|s| (*s).to_string()).collect(),
+                label: None,
+                icon_data_url: None,
             },
         }
     }
@@ -2428,6 +2478,7 @@ mod tests {
                 },
             ],
             processes: vec![],
+            open_apps: vec![],
         }
     }
 
@@ -3574,6 +3625,156 @@ mod tests {
             "stop() must restore Wi-Fi's /32 bypass route"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_hot_switch_default_interface_updates_compiled_final_and_bind_address() {
+        let dir = temp_test_dir("hot-switch-default-iface");
+        let mut snap = base_discovery_snapshot();
+        if let Some(eth) = snap.interfaces.iter_mut().find(|i| i.alias == "Ethernet") {
+            eth.ipv4 = Some("192.168.42.50".to_string());
+            eth.gateway_ipv4 = Some("192.168.42.1".to_string());
+            eth.is_up = true;
+            eth.link_speed_mbps = 1000;
+        }
+        let discovery = Arc::new(MockDiscovery::new(snap));
+        let ops = Arc::new(MockNetworkOps::new(SystemProxySnapshot {
+            proxy_enable: 0,
+            proxy_server: None,
+            proxy_override: None,
+        }));
+        seed_vpn_routes(&ops);
+        ops.seed_interface(12, 25, true, vec![]);
+        ops.seed_interface(15, 35, true, vec![]);
+        let sidecar = Arc::new(MockSidecarRunner::new(Some(Arc::clone(&ops))));
+        let runtime = make_runtime(&dir, discovery, Arc::clone(&ops), Arc::clone(&sidecar));
+
+        let wf_wifi_default = WorkflowGraph {
+            nodes: vec![
+                iface_node("if-wifi", "Wi-Fi", true),
+                iface_node("if-eth", "Ethernet", false),
+            ],
+            edges: vec![],
+        };
+        runtime
+            .apply(Some("wf-1".to_string()), &wf_wifi_default)
+            .await
+            .expect("initial apply succeeds");
+
+        let wf_eth_default = WorkflowGraph {
+            nodes: vec![
+                iface_node("if-wifi", "Wi-Fi", false),
+                iface_node("if-eth", "Ethernet", true),
+            ],
+            edges: vec![],
+        };
+        runtime
+            .apply(Some("wf-1".to_string()), &wf_eth_default)
+            .await
+            .expect("hot-switch default to Ethernet succeeds");
+
+        let (spawns, kills, alive, last_json) = sidecar.stats();
+        assert_eq!(spawns.len(), 2);
+        assert_eq!(kills, 1);
+        assert!(alive);
+
+        let json = last_json.expect("second compiled config exists");
+        assert_eq!(json["route"]["final"], "iface-ethernet");
+        assert_eq!(json["dns"]["final"], "dns-iface-ethernet");
+        assert_eq!(json["route"]["default_domain_resolver"], "dns-iface-ethernet");
+
+        let outbounds = json["outbounds"].as_array().unwrap();
+        let eth_out = outbounds
+            .iter()
+            .find(|o| o["tag"] == "iface-ethernet")
+            .expect("iface-ethernet outbound");
+        assert_eq!(eth_out["bind_interface"], "Ethernet");
+        assert_eq!(eth_out["inet4_bind_address"], "192.168.42.50");
+
+        let dns_servers = json["dns"]["servers"].as_array().unwrap();
+        let eth_dns = dns_servers
+            .iter()
+            .find(|s| s["tag"] == "dns-iface-ethernet")
+            .expect("dns-iface-ethernet server");
+        assert_eq!(eth_dns["bind_interface"], "Ethernet");
+        assert_eq!(eth_dns["inet4_bind_address"], "192.168.42.50");
+
+        runtime.stop().await.expect("clean stop");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_hot_switch_from_karing_to_no_default_uses_original_lowest_metric_interface() {
+        let dir = temp_test_dir("hot-switch-karing-metric-default");
+        let mut snap = base_discovery_snapshot();
+        // Originally Ethernet (if_index=15) has lower metric (20) than Wi-Fi (if_index=12, metric=40),
+        // so Ethernet is Windows' original default gateway before Karing prioritization.
+        if let Some(wifi) = snap.interfaces.iter_mut().find(|i| i.alias == "Wi-Fi") {
+            wifi.is_default_gateway = false;
+        }
+        if let Some(eth) = snap.interfaces.iter_mut().find(|i| i.alias == "Ethernet") {
+            eth.ipv4 = Some("192.168.42.50".to_string());
+            eth.gateway_ipv4 = Some("192.168.42.1".to_string());
+            eth.is_up = true;
+            eth.link_speed_mbps = 1000;
+            eth.is_default_gateway = true;
+        }
+        let discovery = Arc::new(MockDiscovery::new(snap));
+        let ops = Arc::new(MockNetworkOps::new(SystemProxySnapshot {
+            proxy_enable: 0,
+            proxy_server: None,
+            proxy_override: None,
+        }));
+        seed_vpn_routes(&ops);
+        ops.seed_interface(12, 40, true, vec![]);
+        ops.seed_interface(15, 20, true, vec![]);
+        let sidecar = Arc::new(MockSidecarRunner::new(Some(Arc::clone(&ops))));
+        let runtime = make_runtime(&dir, Arc::clone(&discovery), Arc::clone(&ops), Arc::clone(&sidecar));
+
+        // 1. Apply Karing wired to Wi-Fi: NetFlow sets Wi-Fi metric=10 and Ethernet metric=50.
+        runtime
+            .apply(Some("wf-karing".to_string()), &karing_workflow())
+            .await
+            .expect("apply karing on Wi-Fi");
+
+        // Simulate discovery now reporting Wi-Fi as Windows default gateway due to NetFlow's metric=10.
+        {
+            let mut d = discovery.snapshot.lock().unwrap();
+            for iface in &mut d.interfaces {
+                iface.is_default_gateway = iface.alias == "Wi-Fi";
+            }
+        }
+
+        // 2. Hot-switch to a workflow with no Karing and no explicit default node.
+        let wf_no_default = WorkflowGraph {
+            nodes: vec![
+                iface_node("if-wifi", "Wi-Fi", false),
+                iface_node("if-eth", "Ethernet", false),
+                apps_node("apps-1", &["chrome.exe"]),
+            ],
+            edges: vec![edge("e1", "if-wifi", "apps-1")],
+        };
+        runtime
+            .apply(Some("wf-no-default".to_string()), &wf_no_default)
+            .await
+            .expect("hot-switch to no-default workflow");
+
+        let (_, _, _, last_json) = sidecar.stats();
+        let json = last_json.expect("second compiled config exists");
+        let default_direct = json["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tag"] == "default-direct")
+            .expect("default-direct outbound");
+        assert_eq!(
+            default_direct["bind_interface"], "Ethernet",
+            "fallback default must use pre-NetFlow lowest-metric interface (Ethernet), not mutated Karing upstream (Wi-Fi)"
+        );
+        assert_eq!(default_direct["inet4_bind_address"], "192.168.42.50");
+
+        runtime.stop().await.expect("clean stop");
         let _ = fs::remove_dir_all(&dir);
     }
 }

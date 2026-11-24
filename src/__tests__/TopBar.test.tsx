@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { EngineStatus, SavedWorkflow } from "../types/workflow";
@@ -15,6 +15,11 @@ const mockTauri = vi.hoisted(() => ({
   stopRouting: vi.fn(),
   getEngineStatus: vi.fn(),
   takeRecoveryNotice: vi.fn(),
+  getAppSettings: vi.fn(),
+  updateAppSettings: vi.fn(),
+  listAppGroups: vi.fn(),
+  saveAppGroup: vi.fn(),
+  deleteAppGroup: vi.fn(),
   onStatusChanged: vi.fn(),
   onTrafficUpdated: vi.fn(),
   onRecoveryNotice: vi.fn(),
@@ -23,7 +28,7 @@ const mockTauri = vi.hoisted(() => ({
 vi.mock("../lib/tauri", () => mockTauri);
 
 import { TopBar } from "../components/TopBar";
-import { useNetFlowStore } from "../store/useNetFlowStore";
+import { serializeRoutingGraph, useNetFlowStore } from "../store/useNetFlowStore";
 
 const wfA: SavedWorkflow = {
   id: "wf-a",
@@ -195,5 +200,81 @@ describe("TopBar", () => {
     expect(
       screen.getByText(/Cannot delete the active workflow while routing is running/i)
     ).toBeTruthy();
+  });
+
+  it("shows Apply Changes when graph has unapplied edits while active and resets after applying", async () => {
+    const user = userEvent.setup();
+    useNetFlowStore.setState({
+      workflows: [wfA],
+      currentWorkflowId: wfA.id,
+      currentWorkflowName: wfA.name,
+      graph: wfA.graph,
+      engineStatus: activeStatus,
+      appliedGraphSignature: serializeRoutingGraph(wfA.graph),
+    });
+
+    render(<TopBar />);
+    expect(screen.getByRole("button", { name: /Start \/ Apply/i })).toBeTruthy();
+
+    // Add a non-default node to the graph while active -> primary button signals unapplied changes
+    useNetFlowStore.getState().addNode({
+      id: "apps-new",
+      x: 300,
+      y: 120,
+      kind: { type: "apps", apps: ["firefox.exe"] },
+    });
+
+    const applyChangesBtn = await screen.findByRole("button", { name: /Apply Changes/i });
+    await user.click(applyChangesBtn);
+
+    await waitFor(() => {
+      expect(mockTauri.applyWorkflow).toHaveBeenCalledTimes(1);
+    });
+    expect(await screen.findByRole("button", { name: /Start \/ Apply/i })).toBeTruthy();
+  });
+
+  it("opens Settings popover and toggles Start with Windows and Auto-apply last workflow", async () => {
+    const user = userEvent.setup();
+    mockTauri.updateAppSettings
+      .mockResolvedValueOnce({
+        startWithWindows: true,
+        autoApplyLastWorkflow: false,
+        lastActiveWorkflowId: "wf-a",
+      })
+      .mockResolvedValueOnce({
+        startWithWindows: true,
+        autoApplyLastWorkflow: true,
+        lastActiveWorkflowId: "wf-a",
+      });
+
+    useNetFlowStore.setState({
+      appSettings: {
+        startWithWindows: false,
+        autoApplyLastWorkflow: false,
+        lastActiveWorkflowId: "wf-a",
+      },
+    });
+
+    render(<TopBar />);
+
+    await user.click(screen.getByRole("button", { name: "Settings" }));
+    expect(screen.getByRole("dialog", { name: "Application Settings" })).toBeTruthy();
+    expect(screen.getByText(/minimizes NetFlow to the System Tray/i)).toBeTruthy();
+
+    const startSwitch = screen.getByRole("switch", { name: "Start with Windows" });
+    const autoApplySwitch = screen.getByRole("switch", { name: "Auto-apply last workflow" });
+
+    expect(startSwitch.getAttribute("aria-checked")).toBe("false");
+    await user.click(startSwitch);
+    await waitFor(() => {
+      expect(mockTauri.updateAppSettings).toHaveBeenCalledWith({ startWithWindows: true });
+    });
+    expect(startSwitch.getAttribute("aria-checked")).toBe("true");
+
+    await user.click(autoApplySwitch);
+    await waitFor(() => {
+      expect(mockTauri.updateAppSettings).toHaveBeenCalledWith({ autoApplyLastWorkflow: true });
+    });
+    expect(autoApplySwitch.getAttribute("aria-checked")).toBe("true");
   });
 });

@@ -130,7 +130,8 @@ export function isValidWorkflowConnection(
 
 function toFlowNodes(
   workflowNodes: WorkflowNode[],
-  previousNodes: FlowNode[]
+  previousNodes: FlowNode[],
+  selectedNodeId: string | null
 ): FlowNode[] {
   const prevById = new Map(previousNodes.map((n) => [n.id, n]));
   return workflowNodes.map((wfNode) => {
@@ -140,7 +141,7 @@ function toFlowNodes(
       type: wfNode.kind.type,
       position: { x: wfNode.x, y: wfNode.y },
       data: { node: wfNode },
-      selected: prev?.selected,
+      selected: selectedNodeId !== null && wfNode.id === selectedNodeId,
       measured: prev?.measured,
       dragging: prev?.dragging,
     } as FlowNode;
@@ -189,6 +190,7 @@ function toFlowEdges(
 function FlowCanvasInner() {
   const graph = useNetFlowStore((s) => s.graph);
   const engineStatus = useNetFlowStore((s) => s.engineStatus);
+  const selectedNodeId = useNetFlowStore((s) => s.selectedNodeId);
   const fitViewRequestCount = useNetFlowStore((s) => s.fitViewRequestCount);
   const addNode = useNetFlowStore((s) => s.addNode);
   const updateGraph = useNetFlowStore((s) => s.updateGraph);
@@ -196,17 +198,17 @@ function FlowCanvasInner() {
 
   const { screenToFlowPosition, fitView } = useReactFlow<FlowNode, Edge>();
 
-  const rfNodesRef = useRef<FlowNode[]>(toFlowNodes(graph.nodes, []));
+  const rfNodesRef = useRef<FlowNode[]>(toFlowNodes(graph.nodes, [], selectedNodeId));
   const [rfNodes, setRfNodes] = useState<FlowNode[]>(rfNodesRef.current);
 
   const rfEdgesRef = useRef<Edge[]>(toFlowEdges(graph.edges, engineStatus, []));
   const [rfEdges, setRfEdges] = useState<Edge[]>(rfEdgesRef.current);
 
   useEffect(() => {
-    const synced = toFlowNodes(graph.nodes, rfNodesRef.current);
+    const synced = toFlowNodes(graph.nodes, rfNodesRef.current, selectedNodeId);
     rfNodesRef.current = synced;
     setRfNodes(synced);
-  }, [graph.nodes]);
+  }, [graph.nodes, selectedNodeId]);
 
   useEffect(() => {
     const synced = toFlowEdges(graph.edges, engineStatus, rfEdgesRef.current);
@@ -285,7 +287,25 @@ function FlowCanvasInner() {
 
   const onSelectionChange = useCallback(
     ({ nodes }: OnSelectionChangeParams<FlowNode, Edge>) => {
-      setSelectedNodeId(nodes.length > 0 ? nodes[0].id : null);
+      const currentSelected = useNetFlowStore.getState().selectedNodeId;
+      if (nodes.length === 0) {
+        const currentRfNode = currentSelected
+          ? rfNodesRef.current.find((n) => n.id === currentSelected)
+          : undefined;
+        if (!currentRfNode || !currentRfNode.selected) {
+          if (currentSelected !== null) {
+            setSelectedNodeId(null);
+          }
+        }
+        return;
+      }
+      const nextId =
+        nodes.length > 1 && currentSelected
+          ? (nodes.find((n) => n.id !== currentSelected)?.id ?? nodes[0].id)
+          : nodes[0].id;
+      if (nextId !== currentSelected) {
+        setSelectedNodeId(nextId);
+      }
     },
     [setSelectedNodeId]
   );

@@ -34,7 +34,12 @@ export function createDefaultVpnSettings(): VpnNodeSettings {
 export type DragNodePayload =
   | { type: "interface"; interfaceAlias: string }
   | { type: "vpn"; provider: VpnProvider }
-  | { type: "apps" };
+  | {
+      type: "apps";
+      label?: string | null;
+      apps?: string[];
+      iconDataUrl?: string | null;
+    };
 
 export function parseDragNodePayload(raw: string): DragNodePayload | null {
   if (!raw) return null;
@@ -54,7 +59,26 @@ export function parseDragNodePayload(raw: string): DragNodePayload | null {
       return { type: "vpn", provider: record.provider };
     }
     if (record.type === "apps") {
-      return { type: "apps" };
+      const result: Extract<DragNodePayload, { type: "apps" }> = { type: "apps" };
+      if (typeof record.label === "string" && record.label.trim()) {
+        result.label = record.label.trim();
+      }
+      if (Array.isArray(record.apps)) {
+        const apps = record.apps
+          .filter((item): item is string => typeof item === "string")
+          .map((item) => item.trim())
+          .filter(Boolean);
+        if (apps.length > 0) {
+          result.apps = apps;
+        }
+      }
+      if (
+        typeof record.iconDataUrl === "string" &&
+        record.iconDataUrl.startsWith("data:image/")
+      ) {
+        result.iconDataUrl = record.iconDataUrl;
+      }
+      return result;
     }
     return null;
   } catch {
@@ -100,16 +124,34 @@ export function createWorkflowNode(
           settings: createDefaultVpnSettings(),
         },
       };
-    case "apps":
+    case "apps": {
+      const seen = new Set<string>();
+      const apps: string[] = [];
+      for (const rawExe of payload.apps ?? []) {
+        const normalized = rawExe.trim().toLowerCase();
+        if (normalized && !seen.has(normalized)) {
+          seen.add(normalized);
+          apps.push(normalized);
+        }
+      }
+      const trimmedLabel = payload.label?.trim();
+      const kind: Extract<WorkflowNode["kind"], { type: "apps" }> = {
+        type: "apps",
+        apps,
+      };
+      if (trimmedLabel) {
+        kind.label = trimmedLabel;
+      }
+      if (payload.iconDataUrl) {
+        kind.iconDataUrl = payload.iconDataUrl;
+      }
       return {
         id: generateNodeId("apps"),
         x,
         y,
-        kind: {
-          type: "apps",
-          apps: [],
-        },
+        kind,
       };
+    }
   }
 }
 
@@ -175,16 +217,18 @@ export function getNodeCardBorderClass(
 
 interface DefaultTogglePillProps {
   isDefault: boolean;
+  disabled?: boolean;
   onToggle: () => void;
 }
 
-export function DefaultTogglePill({ isDefault, onToggle }: DefaultTogglePillProps) {
+export function DefaultTogglePill({ isDefault, disabled = false, onToggle }: DefaultTogglePillProps) {
   return (
     <button
       type="button"
+      disabled={disabled}
       onClick={onToggle}
       aria-pressed={isDefault}
-      className={`nodrag inline-flex items-center gap-1.5 rounded border px-2 py-1 text-[11px] font-medium transition ${
+      className={`nodrag inline-flex items-center gap-1.5 rounded border px-2 py-1 text-[11px] font-medium transition disabled:cursor-not-allowed disabled:opacity-50 ${
         isDefault
           ? "border-[#3ECF8E]/40 bg-[#3ECF8E]/10 text-[#3ECF8E]"
           : "border-[#232830] bg-[#161A20] text-[#9CA3AF] hover:border-[#2E3540] hover:text-[#F3F4F6]"

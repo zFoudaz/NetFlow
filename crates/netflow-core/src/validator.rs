@@ -456,7 +456,7 @@ fn validate_apps(
         let Some(node) = nodes_by_id.get(id) else {
             continue;
         };
-        let NodeKind::Apps { apps } = &node.kind else {
+        let NodeKind::Apps { apps, .. } = &node.kind else {
             continue;
         };
 
@@ -655,6 +655,8 @@ mod tests {
             y: 0.0,
             kind: NodeKind::Apps {
                 apps: apps.iter().map(|s| (*s).to_string()).collect(),
+                label: None,
+                icon_data_url: None,
             },
         }
     }

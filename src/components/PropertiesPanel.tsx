@@ -1,6 +1,7 @@
 import {
   AlertCircle,
   AppWindow,
+  BookmarkPlus,
   CheckCircle2,
   Info,
   Plus,
@@ -10,9 +11,9 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { useState } from "react";
-import { useNetFlowStore } from "../store/useNetFlowStore";
-import type { WorkflowNode } from "../types/workflow";
+import { useEffect, useState } from "react";
+import { isRoutingActiveState, useNetFlowStore } from "../store/useNetFlowStore";
+import type { SavedAppGroup, WorkflowNode } from "../types/workflow";
 import { AddAppModal, normalizeExeBasename } from "./AddAppModal";
 import {
   DefaultTogglePill,
@@ -25,7 +26,8 @@ import {
 function formatNodeName(node: WorkflowNode): string {
   if (node.kind.type === "interface") return node.kind.interfaceAlias;
   if (node.kind.type === "vpn") return VPN_PROVIDER_LABELS[node.kind.provider];
-  return `Connected Apps (${node.kind.apps.length})`;
+  const label = node.kind.label?.trim() || "Connected Apps";
+  return `${label} (${node.kind.apps.length})`;
 }
 
 export function PropertiesPanel() {
@@ -35,10 +37,14 @@ export function PropertiesPanel() {
   const validationErrors = useNetFlowStore((s) => s.validationErrors);
   const currentWorkflowName = useNetFlowStore((s) => s.currentWorkflowName);
   const isDirty = useNetFlowStore((s) => s.isDirty);
+  const isApplying = useNetFlowStore((s) => s.isApplying);
+  const engineStatus = useNetFlowStore((s) => s.engineStatus);
 
   const setDefaultNode = useNetFlowStore((s) => s.setDefaultNode);
   const updateVpnSettings = useNetFlowStore((s) => s.updateVpnSettings);
   const updateNodeApps = useNetFlowStore((s) => s.updateNodeApps);
+  const updateNodeAppsMeta = useNetFlowStore((s) => s.updateNodeAppsMeta);
+  const saveAppGroup = useNetFlowStore((s) => s.saveAppGroup);
   const updateGraph = useNetFlowStore((s) => s.updateGraph);
   const removeNode = useNetFlowStore((s) => s.removeNode);
   const validateCurrentGraph = useNetFlowStore((s) => s.validateCurrentGraph);
@@ -168,9 +174,13 @@ export function PropertiesPanel() {
       node={selectedNode}
       graph={graph}
       discovery={discovery}
+      isApplying={isApplying}
+      isRoutingActive={isRoutingActiveState(engineStatus.state)}
       setDefaultNode={setDefaultNode}
       updateVpnSettings={updateVpnSettings}
       updateNodeApps={updateNodeApps}
+      updateNodeAppsMeta={updateNodeAppsMeta}
+      saveAppGroup={saveAppGroup}
       updateGraph={updateGraph}
       removeNode={removeNode}
       addModalOpen={addModalOpen}
@@ -183,12 +193,24 @@ interface NodeInspectorProps {
   node: WorkflowNode;
   graph: ReturnType<typeof useNetFlowStore.getState>["graph"];
   discovery: ReturnType<typeof useNetFlowStore.getState>["discovery"];
+  isApplying: boolean;
+  isRoutingActive: boolean;
   setDefaultNode: (nodeId: string, isDefault?: boolean) => void;
   updateVpnSettings: (
     nodeId: string,
     settings: Partial<import("../types/workflow").VpnNodeSettings>
   ) => void;
   updateNodeApps: (nodeId: string, apps: string[]) => void;
+  updateNodeAppsMeta: (
+    nodeId: string,
+    meta: { label?: string | null; iconDataUrl?: string | null }
+  ) => void;
+  saveAppGroup: (input: {
+    id?: string;
+    name: string;
+    apps: string[];
+    iconDataUrl?: string | null;
+  }) => Promise<SavedAppGroup | null>;
   updateGraph: (
     nodes: WorkflowNode[],
     edges: import("../types/workflow").WorkflowEdge[]
@@ -198,19 +220,42 @@ interface NodeInspectorProps {
   setAddModalOpen: (open: boolean) => void;
 }
 
+function defaultRouteHint(isDefault: boolean, isApplying: boolean, isRoutingActive: boolean): string {
+  if (isApplying) {
+    return "Applying default route...";
+  }
+  if (isDefault) {
+    return isRoutingActive
+      ? "Active catch-all route for unlisted apps."
+      : "Will be used as catch-all route when routing starts.";
+  }
+  return isRoutingActive
+    ? "Click to switch the active catch-all route immediately."
+    : "Route unlisted apps here when no specific rule matches.";
+}
+
 function NodeInspector({
   node,
   graph,
   discovery,
+  isApplying,
+  isRoutingActive,
   setDefaultNode,
   updateVpnSettings,
   updateNodeApps,
+  updateNodeAppsMeta,
+  saveAppGroup,
   updateGraph,
   removeNode,
   addModalOpen,
   setAddModalOpen,
 }: NodeInspectorProps) {
   const { nodeErrors, isDropped, errorTooltip } = useNodeDiagnostics(node.id);
+  const [groupSavedOk, setGroupSavedOk] = useState(false);
+
+  useEffect(() => {
+    setGroupSavedOk(false);
+  }, [node.id]);
 
   return (
     <aside
@@ -308,8 +353,12 @@ function NodeInspector({
                 </div>
                 <DefaultTogglePill
                   isDefault={isDefault}
+                  disabled={isApplying}
                   onToggle={() => setDefaultNode(node.id)}
                 />
+                <p className="mt-1.5 text-[11px] text-[#6B7280]">
+                  {defaultRouteHint(isDefault, isApplying, isRoutingActive)}
+                </p>
               </section>
 
               <section className="border-b border-[#232830] px-4 py-3.5">
@@ -556,8 +605,12 @@ function NodeInspector({
                 <div className="mt-3">
                   <DefaultTogglePill
                     isDefault={isDefault}
+                    disabled={isApplying}
                     onToggle={() => setDefaultNode(node.id)}
                   />
+                  <p className="mt-1.5 text-[11px] text-[#6B7280]">
+                    {defaultRouteHint(isDefault, isApplying, isRoutingActive)}
+                  </p>
                 </div>
               </section>
 
@@ -589,7 +642,9 @@ function NodeInspector({
         })()}
 
         {node.kind.type === "apps" && (() => {
-          const { apps } = node.kind;
+          const { apps, label, iconDataUrl } = node.kind;
+          const groupTitle = label?.trim() || "Connected Apps";
+          const trimmedLabel = label?.trim() ?? "";
           const incomingEdge = graph.edges.find((e) => e.target === node.id);
           const upstreamNode = incomingEdge
             ? graph.nodes.find((n) => n.id === incomingEdge.source)
@@ -614,14 +669,35 @@ function NodeInspector({
             );
           };
 
+          const handleSaveGroupToSidebar = async () => {
+            if (!trimmedLabel || apps.length === 0) return;
+            const saved = await saveAppGroup({
+              name: trimmedLabel,
+              apps,
+              iconDataUrl: iconDataUrl ?? null,
+            });
+            if (saved) {
+              setGroupSavedOk(true);
+              setTimeout(() => setGroupSavedOk(false), 2000);
+            }
+          };
+
           return (
             <>
               <section className="border-b border-[#232830] px-4 py-3.5">
                 <div className="flex items-center gap-2.5">
-                  <AppWindow className="h-5 w-5 shrink-0 text-[#3ECF8E]" />
+                  {iconDataUrl ? (
+                    <img
+                      src={iconDataUrl}
+                      alt=""
+                      className="h-5 w-5 shrink-0 rounded-sm object-contain"
+                    />
+                  ) : (
+                    <AppWindow className="h-5 w-5 shrink-0 text-[#3ECF8E]" />
+                  )}
                   <div className="min-w-0">
-                    <div className="text-sm font-semibold text-[#F3F4F6]">
-                      Connected Apps
+                    <div className="truncate text-sm font-semibold text-[#F3F4F6]">
+                      {groupTitle}
                     </div>
                     <div className="mt-0.5 text-xs text-[#9CA3AF]">
                       {apps.length} {apps.length === 1 ? "application" : "applications"}
@@ -633,6 +709,37 @@ function NodeInspector({
                   <span className="font-medium text-[#3ECF8E]">{routeLabel}</span>
                 </div>
                 <NodeErrorCallout errors={nodeErrors} tooltip={errorTooltip} />
+              </section>
+
+              <section className="border-b border-[#232830] px-4 py-3.5">
+                <label className="block space-y-1.5">
+                  <span className="text-[11px] font-medium uppercase tracking-wider text-[#6B7280]">
+                    Group Name
+                  </span>
+                  <input
+                    type="text"
+                    aria-label="Group Name"
+                    value={label ?? ""}
+                    onChange={(e) =>
+                      updateNodeAppsMeta(node.id, { label: e.target.value })
+                    }
+                    placeholder="e.g. Browsers, Gaming, Work"
+                    className="w-full rounded-md border border-[#232830] bg-[#0B0D10] px-2.5 py-1.5 text-xs text-[#F3F4F6] placeholder-[#6B7280] outline-none focus:border-[#3ECF8E]"
+                  />
+                </label>
+                <button
+                  type="button"
+                  disabled={!trimmedLabel || apps.length === 0}
+                  onClick={() => void handleSaveGroupToSidebar()}
+                  className={`mt-2.5 inline-flex w-full items-center justify-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium transition disabled:cursor-not-allowed disabled:opacity-40 ${
+                    groupSavedOk
+                      ? "border-[#3ECF8E]/40 bg-[#3ECF8E]/10 text-[#3ECF8E]"
+                      : "border-[#232830] bg-[#161A20] text-[#F3F4F6] hover:border-[#3ECF8E]/40 hover:bg-[#1D222B] hover:text-[#3ECF8E]"
+                  }`}
+                >
+                  <BookmarkPlus className="h-3.5 w-3.5" />
+                  <span>{groupSavedOk ? "Saved to Sidebar" : "Save to Sidebar"}</span>
+                </button>
               </section>
 
               <section className="border-b border-[#232830] px-4 py-3.5">

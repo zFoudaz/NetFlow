@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -28,6 +28,10 @@ pub struct LiveConnection {
     pub node_id: Option<String>,
     pub upload_bytes: u64,
     pub download_bytes: u64,
+    #[serde(default)]
+    pub upload_bytes_per_sec: u64,
+    #[serde(default)]
+    pub download_bytes_per_sec: u64,
 }
 
 /// Bounded ring buffer retaining up to [`MAX_LIVE_CONNECTIONS`] recent connections.
@@ -35,6 +39,7 @@ pub struct LiveConnection {
 pub struct ConnectionRingBuffer {
     capacity: usize,
     entries: VecDeque<LiveConnection>,
+    last_snapshot_at: Option<Instant>,
 }
 
 impl ConnectionRingBuffer {
@@ -44,22 +49,65 @@ impl ConnectionRingBuffer {
         Self {
             capacity: cap,
             entries: VecDeque::with_capacity(cap),
+            last_snapshot_at: None,
         }
     }
 
-    /// Merges a parsed Clash `/connections` snapshot into the buffer and returns the current items.
+    /// Merges a parsed Clash `/connections` snapshot into the buffer at the current instant and returns the current items.
     pub fn push_snapshot(&mut self, connections: Vec<LiveConnection>) -> Vec<LiveConnection> {
-        for conn in connections {
-            if !conn.id.is_empty() {
-                if let Some(pos) = self.entries.iter().position(|c| c.id == conn.id) {
-                    self.entries.remove(pos);
+        self.push_snapshot_at(connections, Instant::now())
+    }
+
+    /// Merges a parsed Clash `/connections` snapshot at `now`, computing per-connection byte/sec rates from deltas.
+    pub fn push_snapshot_at(
+        &mut self,
+        connections: Vec<LiveConnection>,
+        now: Instant,
+    ) -> Vec<LiveConnection> {
+        let elapsed_ms = self
+            .last_snapshot_at
+            .map(|prev| now.saturating_duration_since(prev).as_millis() as u64)
+            .unwrap_or(0);
+
+        for entry in &mut self.entries {
+            entry.upload_bytes_per_sec = 0;
+            entry.download_bytes_per_sec = 0;
+        }
+
+        for mut conn in connections {
+            let previous = if !conn.id.is_empty() {
+                self.entries
+                    .iter()
+                    .position(|c| c.id == conn.id)
+                    .and_then(|pos| self.entries.remove(pos))
+            } else {
+                None
+            };
+
+            if let Some(prev) = previous {
+                if elapsed_ms > 0 {
+                    let delta_up = conn.upload_bytes.saturating_sub(prev.upload_bytes);
+                    let delta_down = conn.download_bytes.saturating_sub(prev.download_bytes);
+                    conn.upload_bytes_per_sec =
+                        ((delta_up as u128 * 1000) / elapsed_ms as u128) as u64;
+                    conn.download_bytes_per_sec =
+                        ((delta_down as u128 * 1000) / elapsed_ms as u128) as u64;
+                } else {
+                    conn.upload_bytes_per_sec = 0;
+                    conn.download_bytes_per_sec = 0;
                 }
+            } else {
+                conn.upload_bytes_per_sec = 0;
+                conn.download_bytes_per_sec = 0;
             }
+
             while self.entries.len() >= self.capacity {
                 self.entries.pop_front();
             }
             self.entries.push_back(conn);
         }
+
+        self.last_snapshot_at = Some(now);
         self.snapshot()
     }
 
@@ -211,6 +259,8 @@ pub fn parse_clash_connections_json(
                 node_id,
                 upload_bytes: entry.upload,
                 download_bytes: entry.download,
+                upload_bytes_per_sec: 0,
+                download_bytes_per_sec: 0,
             }
         })
         .collect();
@@ -402,6 +452,8 @@ mod tests {
                 node_id: Some("vpn-1".to_string()),
                 upload_bytes: 1200,
                 download_bytes: 8400,
+                upload_bytes_per_sec: 0,
+                download_bytes_per_sec: 0,
             }
         );
 
@@ -416,6 +468,8 @@ mod tests {
                 node_id: Some("if-wifi".to_string()),
                 upload_bytes: 300,
                 download_bytes: 900,
+                upload_bytes_per_sec: 0,
+                download_bytes_per_sec: 0,
             }
         );
 
@@ -430,6 +484,8 @@ mod tests {
                 node_id: None,
                 upload_bytes: 64,
                 download_bytes: 128,
+                upload_bytes_per_sec: 0,
+                download_bytes_per_sec: 0,
             }
         );
 
@@ -453,6 +509,8 @@ mod tests {
                 node_id: Some("vpn-1".to_string()),
                 upload_bytes: 10,
                 download_bytes: 20,
+                upload_bytes_per_sec: 0,
+                download_bytes_per_sec: 0,
             })
             .collect();
         let out_a = ring.push_snapshot(batch_a);
@@ -468,6 +526,8 @@ mod tests {
                 node_id: Some("vpn-1".to_string()),
                 upload_bytes: 10,
                 download_bytes: 20,
+                upload_bytes_per_sec: 0,
+                download_bytes_per_sec: 0,
             })
             .collect();
         batch_b.push(LiveConnection {
@@ -479,6 +539,8 @@ mod tests {
             node_id: Some("vpn-1".to_string()),
             upload_bytes: 999,
             download_bytes: 2000,
+            upload_bytes_per_sec: 0,
+            download_bytes_per_sec: 0,
         });
 
         let out_b = ring.push_snapshot(batch_b);
@@ -487,6 +549,47 @@ mod tests {
         assert_eq!(updated_c0.upload_bytes, 999);
         assert_eq!(updated_c0.download_bytes, 2000);
         assert!(out_b.iter().all(|c| c.id != "c-1"));
+    }
+
+    #[test]
+    fn test_connection_ring_buffer_computes_speed_and_zeros_stale_connections() {
+        let mut ring = ConnectionRingBuffer::default();
+        let t0 = Instant::now();
+        let make_conn = |id: &str, up: u64, down: u64| LiveConnection {
+            id: id.to_string(),
+            process_name: "chrome.exe".to_string(),
+            destination: "example.com:443".to_string(),
+            network: "tcp".to_string(),
+            outbound_tag: "vpn-karing".to_string(),
+            node_id: Some("vpn-1".to_string()),
+            upload_bytes: up,
+            download_bytes: down,
+            upload_bytes_per_sec: 0,
+            download_bytes_per_sec: 0,
+        };
+
+        let first = ring.push_snapshot_at(
+            vec![make_conn("c-active", 1000, 4000), make_conn("c-old", 500, 1500)],
+            t0,
+        );
+        assert_eq!(first[0].upload_bytes_per_sec, 0);
+        assert_eq!(first[0].download_bytes_per_sec, 0);
+
+        let t1 = t0 + Duration::from_secs(2);
+        let second = ring.push_snapshot_at(vec![make_conn("c-active", 3000, 14000)], t1);
+        let active_t1 = second.iter().find(|c| c.id == "c-active").expect("active conn");
+        assert_eq!(active_t1.upload_bytes_per_sec, 1000);
+        assert_eq!(active_t1.download_bytes_per_sec, 5000);
+        let old_t1 = second.iter().find(|c| c.id == "c-old").expect("stale conn kept");
+        assert_eq!(old_t1.upload_bytes_per_sec, 0);
+        assert_eq!(old_t1.download_bytes_per_sec, 0);
+
+        // Next tick without c-active should zero out its speed
+        let t2 = t1 + Duration::from_secs(1);
+        let third = ring.push_snapshot_at(vec![], t2);
+        let active_t2 = third.iter().find(|c| c.id == "c-active").expect("stale active conn");
+        assert_eq!(active_t2.upload_bytes_per_sec, 0);
+        assert_eq!(active_t2.download_bytes_per_sec, 0);
     }
 
     #[tokio::test]

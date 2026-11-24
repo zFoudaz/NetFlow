@@ -1,4 +1,4 @@
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DiscoverySnapshot, WorkflowGraph } from "../types/workflow";
@@ -15,6 +15,11 @@ const mockTauri = vi.hoisted(() => ({
   stopRouting: vi.fn(),
   getEngineStatus: vi.fn(),
   takeRecoveryNotice: vi.fn(),
+  getAppSettings: vi.fn(),
+  updateAppSettings: vi.fn(),
+  listAppGroups: vi.fn(),
+  saveAppGroup: vi.fn(),
+  deleteAppGroup: vi.fn(),
   onStatusChanged: vi.fn(),
   onTrafficUpdated: vi.fn(),
   onRecoveryNotice: vi.fn(),
@@ -244,5 +249,84 @@ describe("PropertiesPanel", () => {
       type: "apps",
       apps: ["discord.exe", "chrome.exe"],
     });
+  });
+
+  it("hot-applies immediately when toggling default route in PropertiesPanel while active", async () => {
+    const user = userEvent.setup();
+    mockTauri.applyWorkflow.mockResolvedValue({
+      state: "active",
+      activeWorkflowId: null,
+      nodeHealth: {},
+      warningBanner: null,
+      lastError: null,
+    });
+    useNetFlowStore.setState({
+      selectedNodeId: "iface-eth",
+      engineStatus: {
+        state: "active",
+        activeWorkflowId: null,
+        nodeHealth: {},
+        warningBanner: null,
+        lastError: null,
+      },
+    });
+
+    render(<PropertiesPanel />);
+    const panel = screen.getByLabelText("Node Properties");
+    expect(
+      within(panel).getByText(/Click to switch the active catch-all route immediately/i)
+    ).toBeTruthy();
+
+    await user.click(within(panel).getByRole("button", { name: /Set as Default/i }));
+
+    await waitFor(() => {
+      expect(mockTauri.applyWorkflow).toHaveBeenCalledTimes(1);
+    });
+    expect(
+      useNetFlowStore.getState().graph.nodes.find((n) => n.id === "iface-eth")?.kind
+    ).toMatchObject({ isDefault: true });
+    expect(
+      useNetFlowStore.getState().graph.nodes.find((n) => n.id === "iface-wifi")?.kind
+    ).toMatchObject({ isDefault: false });
+    expect(
+      await within(panel).findByText(/Active catch-all route for unlisted apps/i)
+    ).toBeTruthy();
+  });
+
+  it("renames a Connected Apps node and saves it as a reusable Saved Group in Sidebar", async () => {
+    const user = userEvent.setup();
+    mockTauri.saveAppGroup.mockImplementation(async (group) => ({
+      ...group,
+      id: "grp-work",
+      updatedAt: "2026-11-24T18:00:00Z",
+    }));
+    useNetFlowStore.setState({ selectedNodeId: "apps-1" });
+
+    render(<PropertiesPanel />);
+    const panel = screen.getByLabelText("Node Properties");
+
+    const saveBtn = within(panel).getByRole("button", { name: /Save to Sidebar/i });
+    expect((saveBtn as HTMLButtonElement).disabled).toBe(true);
+
+    const groupNameInput = within(panel).getByLabelText("Group Name");
+    await user.type(groupNameInput, "Work Apps");
+
+    expect(within(panel).getByText("Work Apps")).toBeTruthy();
+    expect((saveBtn as HTMLButtonElement).disabled).toBe(false);
+
+    await user.click(saveBtn);
+
+    await waitFor(() => {
+      expect(mockTauri.saveAppGroup).toHaveBeenCalledTimes(1);
+    });
+    expect(mockTauri.saveAppGroup).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "Work Apps",
+        apps: ["chrome.exe", "discord.exe"],
+      })
+    );
+    expect(useNetFlowStore.getState().savedAppGroups).toHaveLength(1);
+    expect(useNetFlowStore.getState().savedAppGroups[0].name).toBe("Work Apps");
+    expect(await within(panel).findByText("Saved to Sidebar")).toBeTruthy();
   });
 });

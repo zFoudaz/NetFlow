@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Activity, ArrowDown, ArrowUp, Search, X } from "lucide-react";
+import { Activity, ArrowDown, ArrowUp, ArrowUpDown, Search, X } from "lucide-react";
 import { useNetFlowStore } from "../store/useNetFlowStore";
 import type { LiveConnection, WorkflowNode } from "../types/workflow";
 import { VPN_PROVIDER_LABELS } from "./nodes/nodeShared";
@@ -22,6 +22,14 @@ export function formatBytes(bytes: number): string {
   }
   return `${value.toFixed(1)} ${BYTE_UNITS[unitIndex]}`;
 }
+
+/** Formats a byte-per-second rate into a human-readable speed string (e.g. `1.2 MB/s`). */
+export function formatSpeed(bytesPerSec: number): string {
+  return `${formatBytes(bytesPerSec)}/s`;
+}
+
+type SortKey = "process" | "destination" | "network" | "outbound" | "speed" | "total";
+type SortDirection = "asc" | "desc";
 
 function resolveNodeLabel(node: WorkflowNode | undefined, outboundTag: string): string {
   if (node?.kind.type === "interface") {
@@ -77,6 +85,21 @@ export function LiveTrafficDrawer() {
   const toggleTrafficDrawer = useNetFlowStore((s) => s.toggleTrafficDrawer);
 
   const [filterQuery, setFilterQuery] = useState("");
+  const [sortConfig, setSortConfig] = useState<{
+    key: SortKey;
+    direction: SortDirection;
+  } | null>(null);
+
+  const handleSort = (key: SortKey) => {
+    setSortConfig((prev) => {
+      if (prev && prev.key === key) {
+        return { key, direction: prev.direction === "asc" ? "desc" : "asc" };
+      }
+      const defaultDirection: SortDirection =
+        key === "speed" || key === "total" ? "desc" : "asc";
+      return { key, direction: defaultDirection };
+    });
+  };
 
   const nodesById = useMemo(() => {
     const map = new Map<string, WorkflowNode>();
@@ -112,6 +135,102 @@ export function LiveTrafficDrawer() {
       );
     });
   }, [enrichedConnections, filterQuery]);
+
+  const sortedConnections = useMemo(() => {
+    if (!sortConfig) {
+      return filteredConnections;
+    }
+    const { key, direction } = sortConfig;
+    const factor = direction === "asc" ? 1 : -1;
+
+    return [...filteredConnections].sort((a, b) => {
+      let cmp = 0;
+      switch (key) {
+        case "process":
+          cmp = a.conn.processName.localeCompare(b.conn.processName, undefined, {
+            sensitivity: "base",
+          });
+          break;
+        case "destination":
+          cmp = a.conn.destination.localeCompare(b.conn.destination, undefined, {
+            sensitivity: "base",
+          });
+          break;
+        case "network":
+          cmp = a.conn.network.localeCompare(b.conn.network, undefined, {
+            sensitivity: "base",
+          });
+          break;
+        case "outbound":
+          cmp = a.nodeLabel.localeCompare(b.nodeLabel, undefined, {
+            sensitivity: "base",
+          });
+          break;
+        case "speed": {
+          const speedA =
+            (a.conn.uploadBytesPerSec ?? 0) + (a.conn.downloadBytesPerSec ?? 0);
+          const speedB =
+            (b.conn.uploadBytesPerSec ?? 0) + (b.conn.downloadBytesPerSec ?? 0);
+          cmp = speedA - speedB;
+          if (cmp === 0) {
+            const totalA = a.conn.uploadBytes + a.conn.downloadBytes;
+            const totalB = b.conn.uploadBytes + b.conn.downloadBytes;
+            cmp = totalA - totalB;
+          }
+          break;
+        }
+        case "total": {
+          const totalA = a.conn.uploadBytes + a.conn.downloadBytes;
+          const totalB = b.conn.uploadBytes + b.conn.downloadBytes;
+          cmp = totalA - totalB;
+          break;
+        }
+      }
+      if (cmp === 0) {
+        cmp = a.conn.processName.localeCompare(b.conn.processName, undefined, {
+          sensitivity: "base",
+        });
+      }
+      return cmp * factor;
+    });
+  }, [filteredConnections, sortConfig]);
+
+  const renderSortHeader = (
+    key: SortKey,
+    label: string,
+    alignRight = false
+  ) => {
+    const isActive = sortConfig?.key === key;
+    const ariaSort: "none" | "ascending" | "descending" = isActive
+      ? sortConfig.direction === "asc"
+        ? "ascending"
+        : "descending"
+      : "none";
+
+    const Icon = !isActive
+      ? ArrowUpDown
+      : sortConfig.direction === "asc"
+        ? ArrowUp
+        : ArrowDown;
+
+    return (
+      <th
+        aria-sort={ariaSort}
+        className={`px-4 py-2 ${alignRight ? "text-right" : "text-left"}`}
+      >
+        <button
+          type="button"
+          onClick={() => handleSort(key)}
+          className={`inline-flex items-center gap-1 font-medium uppercase tracking-wider transition hover:text-[#F3F4F6] ${
+            isActive ? "text-[#3ECF8E]" : "text-[#6B7280]"
+          } ${alignRight ? "ml-auto flex-row-reverse" : ""}`}
+        >
+          <span>{label}</span>
+          <Icon className="h-3 w-3 shrink-0" />
+        </button>
+      </th>
+    );
+  };
 
   if (!isTrafficDrawerOpen) {
     return null;
@@ -182,55 +301,69 @@ export function LiveTrafficDrawer() {
           <table className="w-full border-collapse text-left text-xs">
             <thead className="sticky top-0 z-10 border-b border-[#232830] bg-[#111418] text-[11px] font-medium uppercase tracking-wider text-[#6B7280]">
               <tr>
-                <th className="px-4 py-2">Process</th>
-                <th className="px-4 py-2">Destination</th>
-                <th className="px-4 py-2">Protocol</th>
-                <th className="px-4 py-2">Matched Node / Outbound</th>
-                <th className="px-4 py-2 text-right">Up / Down</th>
+                {renderSortHeader("process", "Process")}
+                {renderSortHeader("destination", "Destination")}
+                {renderSortHeader("network", "Protocol")}
+                {renderSortHeader("outbound", "Matched Node / Outbound")}
+                {renderSortHeader("speed", "Speed", true)}
+                {renderSortHeader("total", "Up / Down", true)}
               </tr>
             </thead>
             <tbody className="divide-y divide-[#1A1F26]">
-              {filteredConnections.map(({ conn, nodeLabel, badgeClass }) => (
-                <tr key={conn.id} className="hover:bg-[#161A20]">
-                  <td className="whitespace-nowrap px-4 py-1.5 font-medium text-[#F3F4F6]">
-                    {conn.processName}
-                  </td>
-                  <td className="whitespace-nowrap px-4 py-1.5 font-mono text-[#9CA3AF]">
-                    {conn.destination}
-                  </td>
-                  <td className="whitespace-nowrap px-4 py-1.5 uppercase text-[#6B7280]">
-                    {conn.network}
-                  </td>
-                  <td className="whitespace-nowrap px-4 py-1.5">
-                    <div className="inline-flex items-center gap-2">
-                      <span
-                        data-testid={`outbound-badge-${conn.id}`}
-                        className={`inline-flex items-center rounded border px-2 py-0.5 text-[11px] font-medium ${badgeClass}`}
-                      >
-                        {nodeLabel}
-                      </span>
-                      {nodeLabel !== conn.outboundTag && (
-                        <span className="font-mono text-[11px] text-[#6B7280]">
-                          {conn.outboundTag}
+              {sortedConnections.map(({ conn, nodeLabel, badgeClass }) => {
+                const upSpeed = conn.uploadBytesPerSec ?? 0;
+                const downSpeed = conn.downloadBytesPerSec ?? 0;
+                const totalSpeed = upSpeed + downSpeed;
+                return (
+                  <tr key={conn.id} className="hover:bg-[#161A20]">
+                    <td className="whitespace-nowrap px-4 py-1.5 font-medium text-[#F3F4F6]">
+                      {conn.processName}
+                    </td>
+                    <td className="whitespace-nowrap px-4 py-1.5 font-mono text-[#9CA3AF]">
+                      {conn.destination}
+                    </td>
+                    <td className="whitespace-nowrap px-4 py-1.5 uppercase text-[#6B7280]">
+                      {conn.network}
+                    </td>
+                    <td className="whitespace-nowrap px-4 py-1.5">
+                      <div className="inline-flex items-center gap-2">
+                        <span
+                          data-testid={`outbound-badge-${conn.id}`}
+                          className={`inline-flex items-center rounded border px-2 py-0.5 text-[11px] font-medium ${badgeClass}`}
+                        >
+                          {nodeLabel}
                         </span>
-                      )}
-                    </div>
-                  </td>
-                  <td className="whitespace-nowrap px-4 py-1.5 text-right font-mono text-[#D1D5DB]">
-                    <span className="inline-flex items-center gap-2">
-                      <span className="inline-flex items-center gap-0.5 text-[#14B8A6]">
-                        <ArrowUp className="h-3 w-3" />
-                        {formatBytes(conn.uploadBytes)}
+                        {nodeLabel !== conn.outboundTag && (
+                          <span className="font-mono text-[11px] text-[#6B7280]">
+                            {conn.outboundTag}
+                          </span>
+                        )}
+                      </div>
+                    </td>
+                    <td
+                      title={`Up ${formatSpeed(upSpeed)} / Down ${formatSpeed(downSpeed)}`}
+                      className={`whitespace-nowrap px-4 py-1.5 text-right font-mono ${
+                        totalSpeed > 0 ? "text-[#3ECF8E]" : "text-[#6B7280]"
+                      }`}
+                    >
+                      {formatSpeed(totalSpeed)}
+                    </td>
+                    <td className="whitespace-nowrap px-4 py-1.5 text-right font-mono text-[#D1D5DB]">
+                      <span className="inline-flex items-center gap-2">
+                        <span className="inline-flex items-center gap-0.5 text-[#14B8A6]">
+                          <ArrowUp className="h-3 w-3" />
+                          {formatBytes(conn.uploadBytes)}
+                        </span>
+                        <span className="text-[#4B5563]">/</span>
+                        <span className="inline-flex items-center gap-0.5 text-[#3ECF8E]">
+                          <ArrowDown className="h-3 w-3" />
+                          {formatBytes(conn.downloadBytes)}
+                        </span>
                       </span>
-                      <span className="text-[#4B5563]">/</span>
-                      <span className="inline-flex items-center gap-0.5 text-[#3ECF8E]">
-                        <ArrowDown className="h-3 w-3" />
-                        {formatBytes(conn.downloadBytes)}
-                      </span>
-                    </span>
-                  </td>
-                </tr>
-              ))}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         )}

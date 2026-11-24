@@ -1,9 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  AppSettings,
+  AppSettingsUpdate,
   DiscoverySnapshot,
   EngineStatus,
   LiveConnection,
+  SavedAppGroup,
   SavedWorkflow,
   WorkflowGraph,
 } from "../types/workflow";
@@ -68,6 +71,31 @@ export function getEngineStatus(): Promise<EngineStatus> {
 /** Retrieves and clears any pending startup crash-recovery notice. */
 export function takeRecoveryNotice(): Promise<string | null> {
   return invoke<string | null>("take_recovery_notice");
+}
+
+/** Loads persistent application settings reconciled with OS auto-start status. */
+export function getAppSettings(): Promise<AppSettings> {
+  return invoke<AppSettings>("get_app_settings");
+}
+
+/** Updates persistent application settings and Windows Task Scheduler auto-start. */
+export function updateAppSettings(update: AppSettingsUpdate): Promise<AppSettings> {
+  return invoke<AppSettings>("update_app_settings", { update });
+}
+
+/** Lists all saved reusable connection app groups ordered by `updatedAt` descending. */
+export function listAppGroups(): Promise<SavedAppGroup[]> {
+  return invoke<SavedAppGroup[]>("list_app_groups");
+}
+
+/** Saves or updates a reusable named connection app group on disk. */
+export function saveAppGroup(group: SavedAppGroup): Promise<SavedAppGroup> {
+  return invoke<SavedAppGroup>("save_app_group", { group });
+}
+
+/** Deletes a saved connection app group by ID. */
+export function deleteAppGroup(id: string): Promise<null> {
+  return invoke<null>("delete_app_group", { id });
 }
 
 /** Subscribes to live `EngineStatus` updates from the backend. */
