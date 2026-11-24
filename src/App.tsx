@@ -1,13 +1,49 @@
+import { useEffect } from "react";
+import { FlowCanvas } from "./components/FlowCanvas";
+import { Sidebar } from "./components/Sidebar";
+import { TopBar } from "./components/TopBar";
+import { useNetFlowStore } from "./store/useNetFlowStore";
+
 export function App() {
+  const initEventListeners = useNetFlowStore((s) => s.initEventListeners);
+  const refreshDiscovery = useNetFlowStore((s) => s.refreshDiscovery);
+  const loadWorkflows = useNetFlowStore((s) => s.loadWorkflows);
+
+  useEffect(() => {
+    let active = true;
+    let cleanup: (() => void) | undefined;
+
+    void initEventListeners()
+      .then((unlisten) => {
+        if (active) {
+          cleanup = unlisten;
+        } else {
+          unlisten();
+        }
+      })
+      .catch(() => {
+        // Safe no-op outside Tauri webview runtime
+      });
+
+    void refreshDiscovery();
+    void loadWorkflows();
+
+    return () => {
+      active = false;
+      cleanup?.();
+    };
+  }, [initEventListeners, loadWorkflows, refreshDiscovery]);
+
   return (
-    <main className="flex min-h-screen items-center justify-center bg-slate-950 text-slate-100">
-      <div className="text-center">
-        <h1 className="text-2xl font-semibold tracking-tight">NetFlow</h1>
-        <p className="mt-2 text-sm text-slate-400">
-          Per-application multi-interface VPN routing
-        </p>
+    <div className="flex h-screen w-screen flex-col overflow-hidden bg-slate-950 text-slate-100">
+      <TopBar />
+      <div className="flex min-h-0 flex-1 overflow-hidden">
+        <Sidebar />
+        <main className="relative min-w-0 flex-1 overflow-hidden">
+          <FlowCanvas />
+        </main>
       </div>
-    </main>
+    </div>
   );
 }
 
