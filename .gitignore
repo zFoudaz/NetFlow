@@ -2,6 +2,7 @@
 target/
 node_modules/
 dist/
+src-tauri/gen/
 
 # Bundled large binaries (fetched via scripts/fetch-sidecars.ps1)
 src-tauri/binaries/*.exe
