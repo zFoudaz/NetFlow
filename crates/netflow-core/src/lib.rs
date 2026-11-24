@@ -4,6 +4,7 @@
 //! Intentionally free of any `tauri` dependency so it can be tested headlessly and
 //! reused across targets.
 
+pub mod compiler;
 pub mod model;
 pub mod validator;
 
