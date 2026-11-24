@@ -79,6 +79,8 @@ pub struct RecoverySnapshot {
     #[serde(default)]
     pub removed_bypass_routes: Vec<RouteRecord>,
     #[serde(default)]
+    pub physical_metric_snapshots: Vec<InterfaceMetricSnapshot>,
+    #[serde(default)]
     pub singbox_pid: Option<u32>,
 }
 
@@ -269,6 +271,7 @@ mod tests {
                 route_metric: 5,
                 is_ipv6: false,
             }],
+            physical_metric_snapshots: Vec::new(),
             singbox_pid: Some(4242),
         };
 
@@ -317,6 +320,7 @@ mod tests {
             vpn_entries: HashMap::new(),
             pinned_host_routes: Vec::new(),
             removed_bypass_routes: Vec::new(),
+            physical_metric_snapshots: Vec::new(),
             singbox_pid: None,
         };
 

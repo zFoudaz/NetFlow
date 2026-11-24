@@ -19,7 +19,9 @@ use crate::discovery::{
 use crate::model::{
     NodeKind, ValidatedGraph, ValidatedVpnChain, ValidationError, VpnProvider, WorkflowGraph,
 };
-use crate::recovery::{RecoveryError, RecoverySnapshot, RecoveryStore, RouteRecord};
+use crate::recovery::{
+    InterfaceMetricSnapshot, RecoveryError, RecoverySnapshot, RecoveryStore, RouteRecord,
+};
 use crate::storage::{default_netflow_dir, write_atomic};
 use crate::traffic::{LiveConnection, TrafficMonitor};
 use crate::validator::validate_graph;
@@ -730,6 +732,7 @@ impl EngineRuntime {
                 vpn_entries: HashMap::new(),
                 pinned_host_routes: Vec::new(),
                 removed_bypass_routes: Vec::new(),
+                physical_metric_snapshots: Vec::new(),
                 singbox_pid: None,
             };
             let store = self.recovery_store.clone();
@@ -1374,6 +1377,13 @@ fn apply_cold_start_mutations_blocking(
         snapshot.insert_vpn_if_absent(entry);
         recovery_store.save_atomic(snapshot)?;
 
+        maybe_prioritize_karing_upstream_interface_blocking(
+            net_ops,
+            recovery_store,
+            prepared,
+            chain,
+            snapshot,
+        )?;
         maybe_pin_openvpn_route_blocking(net_ops, recovery_store, prepared, chain, resolved, snapshot)?;
     }
 
@@ -1398,6 +1408,14 @@ fn reconcile_hot_switch_removals_blocking(
         while let Some(route) = snapshot.removed_bypass_routes.last().cloned() {
             add_route_ignore_benign(net_ops, &route)?;
             snapshot.removed_bypass_routes.pop();
+        }
+        recovery_store.save_atomic(snapshot)?;
+    }
+
+    if !new_providers.contains(&VpnProvider::Karing) && !snapshot.physical_metric_snapshots.is_empty() {
+        while let Some(metric_snap) = snapshot.physical_metric_snapshots.last().cloned() {
+            restore_metric_ignore_missing(net_ops, &metric_snap)?;
+            snapshot.physical_metric_snapshots.pop();
         }
         recovery_store.save_atomic(snapshot)?;
     }
@@ -1441,6 +1459,13 @@ fn apply_remaining_hot_switch_vpns_blocking(
             recovery_store.save_atomic(snapshot)?;
         }
 
+        maybe_prioritize_karing_upstream_interface_blocking(
+            net_ops,
+            recovery_store,
+            prepared,
+            chain,
+            snapshot,
+        )?;
         maybe_pin_openvpn_route_blocking(
             net_ops,
             recovery_store,
@@ -1450,6 +1475,84 @@ fn apply_remaining_hot_switch_vpns_blocking(
             snapshot,
         )?;
     }
+    Ok(())
+}
+
+const KARING_PREFERRED_PHYSICAL_METRIC: u32 = 10;
+const KARING_DEPRIORITIZED_PHYSICAL_METRIC: u32 = 50;
+
+/// Karing (`karingService.exe`) runs its own embedded `sing-box` with
+/// `auto_detect_interface: true`, which binds outbound sockets via `IP_UNICAST_IF`
+/// to whichever physical Windows adapter has the lowest IPv4 `InterfaceMetric`
+/// (bypassing `NetFlow-TUN`). When 2+ physical interfaces are up and Karing is
+/// wired directly to a specific physical interface, we set that interface's
+/// metric to `10` and other up physical interfaces to `50` (snapshotting
+/// original metrics in `recovery.json` first) so Karing's `default_interface_monitor`
+/// switches its outbound tunnel to the chosen interface immediately.
+fn maybe_prioritize_karing_upstream_interface_blocking(
+    net_ops: &dyn WindowsNetworkOps,
+    recovery_store: &RecoveryStore,
+    prepared: &PreparedApply,
+    chain: &crate::model::ValidatedVpnChain,
+    snapshot: &mut RecoverySnapshot,
+) -> Result<(), RuntimeError> {
+    if chain.provider != VpnProvider::Karing {
+        return Ok(());
+    }
+
+    let Some(upstream_node) = prepared.validated.nodes_by_id.get(&chain.upstream_node_id) else {
+        return Ok(());
+    };
+    let NodeKind::Interface {
+        interface_alias, ..
+    } = &upstream_node.kind
+    else {
+        return Ok(());
+    };
+
+    let up_physical: Vec<&PhysicalInterfaceInfo> = prepared
+        .discovery_snap
+        .interfaces
+        .iter()
+        .filter(|i| i.is_up)
+        .collect();
+    if up_physical.len() < 2 {
+        return Ok(());
+    }
+
+    let Some(target_iface) = up_physical
+        .iter()
+        .find(|i| i.alias.eq_ignore_ascii_case(interface_alias))
+    else {
+        return Ok(());
+    };
+
+    let mut recorded_new = false;
+    for iface in &up_physical {
+        let already_saved = snapshot
+            .physical_metric_snapshots
+            .iter()
+            .any(|s| s.interface_index == iface.if_index && !s.is_ipv6);
+        if !already_saved {
+            if let Ok(metric_snap) = net_ops.get_interface_metric(iface.if_index, false) {
+                snapshot.physical_metric_snapshots.push(metric_snap);
+                recorded_new = true;
+            }
+        }
+    }
+    if recorded_new {
+        recovery_store.save_atomic(snapshot)?;
+    }
+
+    for iface in &up_physical {
+        let desired_metric = if iface.if_index == target_iface.if_index {
+            KARING_PREFERRED_PHYSICAL_METRIC
+        } else {
+            KARING_DEPRIORITIZED_PHYSICAL_METRIC
+        };
+        net_ops.set_interface_metric(iface.if_index, false, desired_metric, false)?;
+    }
+
     Ok(())
 }
 
@@ -1665,6 +1768,25 @@ fn add_or_replace_route(
     }
 }
 
+fn restore_metric_ignore_missing(
+    ops: &dyn WindowsNetworkOps,
+    metric_snap: &InterfaceMetricSnapshot,
+) -> Result<(), NetOpsError> {
+    match ops.restore_interface_metric(metric_snap) {
+        Ok(()) => Ok(()),
+        Err(err)
+            if crate::win_net::is_benign_restore_metric_error(
+                ops,
+                metric_snap.interface_index,
+                &err,
+            ) =>
+        {
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
 fn restore_snapshot_state(
     ops: &dyn WindowsNetworkOps,
     snapshot: &RecoverySnapshot,
@@ -1685,6 +1807,15 @@ fn restore_snapshot_state(
             errors.push(format!(
                 "restore removed bypass route {}: {err}",
                 route.destination_prefix
+            ));
+        }
+    }
+
+    for metric_snap in &snapshot.physical_metric_snapshots {
+        if let Err(err) = restore_metric_ignore_missing(ops, metric_snap) {
+            errors.push(format!(
+                "restore physical metric ifIndex={}: {err}",
+                metric_snap.interface_index
             ));
         }
     }
@@ -2531,6 +2662,7 @@ mod tests {
                 vpn_entries,
                 pinned_host_routes: vec![pinned.clone()],
                 removed_bypass_routes: Vec::new(),
+                physical_metric_snapshots: Vec::new(),
                 singbox_pid: None,
             })
             .expect("seed stale recovery.json");
@@ -3162,6 +3294,7 @@ mod tests {
                 vpn_entries,
                 pinned_host_routes: vec![vanished_pinned],
                 removed_bypass_routes: Vec::new(),
+                physical_metric_snapshots: Vec::new(),
                 singbox_pid: Some(999999),
             })
             .expect("seed recovery snapshot");

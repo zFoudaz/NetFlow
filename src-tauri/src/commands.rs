@@ -889,6 +889,7 @@ mod tests {
             vpn_entries: HashMap::new(),
             pinned_host_routes: Vec::new(),
             removed_bypass_routes: Vec::new(),
+            physical_metric_snapshots: Vec::new(),
             singbox_pid: None,
         };
         RecoveryStore::new(recovery_path.clone())
