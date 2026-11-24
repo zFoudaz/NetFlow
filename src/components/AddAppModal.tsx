@@ -23,7 +23,17 @@ export function normalizeExeBasename(raw: string): string | null {
     }
   }
 
-  return filename.toLowerCase();
+  const lower = filename.toLowerCase();
+  if (lower.endsWith(".")) {
+    return null;
+  }
+
+  const stem = lower.endsWith(".exe") ? lower.slice(0, -4) : lower;
+  if (!stem.replace(/[. ]/g, "")) {
+    return null;
+  }
+
+  return lower.endsWith(".exe") ? lower : `${lower}.exe`;
 }
 
 interface AddAppModalProps {
@@ -46,7 +56,7 @@ export function AddAppModal({
   const [feedback, setFeedback] = useState<string | null>(null);
 
   const existingSet = useMemo(
-    () => new Set(existingApps.map((app) => app.toLowerCase())),
+    () => new Set(existingApps.map((app) => normalizeExeBasename(app) ?? app.toLowerCase())),
     [existingApps]
   );
 

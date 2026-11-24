@@ -13,7 +13,7 @@ import {
 
 function getVpnHint(provider: VpnProvider, info?: DetectedVpnInfo): string {
   if (provider === "karing") {
-    return info?.detectedPort ? `Port ${info.detectedPort}` : "Port 3080 (auto)";
+    return info?.detectedPort ? `Port ${info.detectedPort}` : "Port 3067 (auto)";
   }
   if (provider === "cloudflareWarp") {
     return info?.warpCurrentMode

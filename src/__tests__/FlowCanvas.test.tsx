@@ -27,6 +27,7 @@ const mockDialog = vi.hoisted(() => ({
 vi.mock("../lib/tauri", () => mockTauri);
 vi.mock("@tauri-apps/plugin-dialog", () => mockDialog);
 
+import { normalizeExeBasename } from "../components/AddAppModal";
 import { FlowCanvas, isValidWorkflowConnection } from "../components/FlowCanvas";
 import { Sidebar } from "../components/Sidebar";
 import { useNetFlowStore } from "../store/useNetFlowStore";
@@ -61,6 +62,7 @@ const sampleDiscovery: DiscoverySnapshot = {
       detectedPort: 3080,
       adapterAlias: null,
       adapterIfIndex: null,
+      adapterIsUp: false,
       adapterGateway: null,
       remoteServerIp: null,
       warpCurrentMode: null,
@@ -71,6 +73,7 @@ const sampleDiscovery: DiscoverySnapshot = {
       detectedPort: 40000,
       adapterAlias: "CloudflareWARP",
       adapterIfIndex: 21,
+      adapterIsUp: true,
       adapterGateway: "172.16.0.1",
       remoteServerIp: "162.159.193.1",
       warpCurrentMode: "tun",
@@ -81,6 +84,7 @@ const sampleDiscovery: DiscoverySnapshot = {
       detectedPort: null,
       adapterAlias: "OpenVPN Wintun",
       adapterIfIndex: null,
+      adapterIsUp: false,
       adapterGateway: null,
       remoteServerIp: null,
       warpCurrentMode: null,
@@ -719,5 +723,56 @@ describe("FlowCanvas, Sidebar, and Custom Nodes", () => {
     // Deleting a node removes it from store
     await user.click(within(karingNode).getByRole("button", { name: /Delete Karing node/i }));
     expect(useNetFlowStore.getState().graph.nodes.some((n) => n.id === "vpn-karing")).toBe(false);
+  });
+
+  it("rejects stemless .exe names and detects chrome vs chrome.exe duplicates in AddAppModal", async () => {
+    expect(normalizeExeBasename(".exe")).toBeNull();
+    expect(normalizeExeBasename(" .EXE ")).toBeNull();
+    expect(normalizeExeBasename("C:\\Tools\\.exe")).toBeNull();
+    expect(normalizeExeBasename("chrome.")).toBeNull();
+    expect(normalizeExeBasename("chrome")).toBe("chrome.exe");
+
+    const user = userEvent.setup();
+    useNetFlowStore.setState({
+      graph: {
+        nodes: [
+          {
+            id: "apps-1",
+            x: 200,
+            y: 120,
+            kind: { type: "apps", apps: ["chrome.exe"] },
+          },
+        ],
+        edges: [],
+      },
+    });
+
+    render(<FlowCanvas />);
+
+    const appsNode = await screen.findByTestId("flow-node-apps-1");
+    await user.click(within(appsNode).getByRole("button", { name: /\+ Add App/i }));
+    const dialog = await screen.findByRole("dialog", { name: /Add Application/i });
+    const manualInput = within(dialog).getByLabelText(/Manual executable name/i);
+    const addBtn = within(dialog).getByRole("button", { name: /^Add$/i });
+
+    // Stemless ".exe" is rejected with validation feedback
+    await user.type(manualInput, ".exe");
+    await user.click(addBtn);
+    expect(
+      await within(dialog).findByText(/Enter a valid executable filename/i)
+    ).toBeTruthy();
+
+    // Un-suffixed "chrome" collides with existing "chrome.exe"
+    await user.clear(manualInput);
+    await user.type(manualInput, "chrome");
+    await user.click(addBtn);
+    expect(
+      await within(dialog).findByText(/'chrome\.exe' is already assigned to this node\./i)
+    ).toBeTruthy();
+
+    expect(useNetFlowStore.getState().graph.nodes[0].kind).toEqual({
+      type: "apps",
+      apps: ["chrome.exe"],
+    });
   });
 });

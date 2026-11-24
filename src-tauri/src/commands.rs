@@ -461,6 +461,7 @@ mod tests {
                         detected_port: None,
                         adapter_alias: None,
                         adapter_if_index: None,
+                        adapter_is_up: false,
                         adapter_gateway: None,
                         remote_server_ip: None,
                         warp_current_mode: None,
@@ -600,7 +601,16 @@ mod tests {
             self.alive.load(Ordering::SeqCst)
         }
 
+        fn pid(&self) -> Option<u32> {
+            self.alive.load(Ordering::SeqCst).then_some(4242)
+        }
+
         fn kill(&self) -> Result<(), SidecarError> {
+            self.alive.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn kill_pid(&self, _pid: u32) -> Result<(), netflow_core::runtime::RuntimeError> {
             self.alive.store(false, Ordering::SeqCst);
             Ok(())
         }
@@ -887,6 +897,8 @@ mod tests {
             }),
             vpn_entries: HashMap::new(),
             pinned_host_routes: Vec::new(),
+            removed_bypass_routes: Vec::new(),
+            singbox_pid: None,
         };
         RecoveryStore::new(recovery_path.clone())
             .save_atomic(&stale)

@@ -9,11 +9,13 @@ use crate::compiler::ResolvedVpnRuntimeInfo;
 use crate::discovery::{DetectedVpnInfo, PhysicalInterfaceInfo};
 use crate::model::{VpnNodeSettings, VpnProvider, WarpMode};
 use crate::recovery::{RouteRecord, VpnRecoveryEntry};
-use crate::win_net::{NetOpsError, WindowsNetworkOps};
+use crate::win_net::{
+    is_benign_remove_route_error, is_benign_restore_add_route_error,
+    is_benign_restore_metric_error, NetOpsError, WindowsNetworkOps, ERROR_NOT_FOUND_CODE,
+};
 
 const NEUTRALIZED_METRIC: u32 = 500;
 const DEFAULT_WARP_PROXY_PORT: u16 = 40000;
-const ERROR_NOT_FOUND_CODE: u32 = 1168;
 
 /// Typed errors returned by VPN adapter pre-flight, neutralization, pinning, and restoration.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -81,6 +83,9 @@ pub fn preflight_and_resolve_vpn(
         }
         VpnProvider::CloudflareWarp => match settings.warp_mode {
             WarpMode::Tun => {
+                if !detected.adapter_is_up {
+                    return Err(VpnAdapterError::NotRunning(VpnProvider::CloudflareWarp));
+                }
                 let alias = non_empty_trimmed(detected.adapter_alias.as_deref())
                     .or_else(|| detected.adapter_if_index.map(|_| "CloudflareWARP".to_string()))
                     .ok_or(VpnAdapterError::MissingWarpAdapterAlias)?;
@@ -95,6 +100,15 @@ pub fn preflight_and_resolve_vpn(
                 })
             }
             WarpMode::Proxy => {
+                let proxy_ready = detected.detected_port.is_some()
+                    || detected.adapter_is_up
+                    || detected
+                        .warp_current_mode
+                        .as_deref()
+                        .is_some_and(|m| m.eq_ignore_ascii_case("proxy"));
+                if !proxy_ready {
+                    return Err(VpnAdapterError::NotRunning(VpnProvider::CloudflareWarp));
+                }
                 let port = detected
                     .detected_port
                     .filter(|&p| p != 0)
@@ -111,6 +125,9 @@ pub fn preflight_and_resolve_vpn(
             }
         },
         VpnProvider::OpenVpn => {
+            if !detected.adapter_is_up {
+                return Err(VpnAdapterError::NotRunning(VpnProvider::OpenVpn));
+            }
             let alias = non_empty_trimmed(settings.openvpn_adapter_override.as_deref())
                 .or_else(|| non_empty_trimmed(detected.adapter_alias.as_deref()))
                 .ok_or(VpnAdapterError::MissingOpenVpnAdapterAlias)?;
@@ -212,19 +229,25 @@ pub fn restore_vpn(
 
     for route in &entry.added_routes {
         if let Err(err) = ops.remove_route(route) {
-            errors.push(err);
+            if !is_benign_remove_route_error(ops, route.interface_index, &err) {
+                errors.push(err);
+            }
         }
     }
 
     for snapshot in &entry.metric_snapshots {
         if let Err(err) = ops.restore_interface_metric(snapshot) {
-            errors.push(err);
+            if !is_benign_restore_metric_error(ops, snapshot.interface_index, &err) {
+                errors.push(err);
+            }
         }
     }
 
     for route in &entry.removed_routes {
         if let Err(err) = ops.add_route(route) {
-            errors.push(err);
+            if !is_benign_restore_add_route_error(ops, route.interface_index, &err) {
+                errors.push(err);
+            }
         }
     }
 
@@ -249,11 +272,14 @@ pub fn restore_vpn(
 }
 
 /// Pins `<server_ip>/32` via the upstream physical interface gateway so OpenVPN DCO avoids loops.
+///
+/// Returns `Ok(None)` when a matching `<server_ip>/32` route via `upstream_if`'s gateway already
+/// exists on `upstream_if.if_index`, so NetFlow never duplicates or later deletes OpenVPN's route.
 pub fn pin_openvpn_dco_host_route(
     ops: &dyn WindowsNetworkOps,
     server_ip: &str,
     upstream_if: &PhysicalInterfaceInfo,
-) -> Result<RouteRecord, VpnAdapterError> {
+) -> Result<Option<RouteRecord>, VpnAdapterError> {
     let ip = validate_routable_ipv4(server_ip)?;
     let gateway = non_empty_trimmed(upstream_if.gateway_ipv4.as_deref())
         .and_then(|gw| parse_usable_ipv4_gateway(&gw))
@@ -262,15 +288,26 @@ pub fn pin_openvpn_dco_host_route(
             if_index: upstream_if.if_index,
         })?;
 
+    let target_prefix = format!("{ip}/32");
+    let existing = ops.list_routes(Some(upstream_if.if_index), false)?;
+    if existing.iter().any(|r| {
+        !r.is_ipv6
+            && r.interface_index == upstream_if.if_index
+            && canonical_prefix(r).as_deref() == Some(target_prefix.as_str())
+            && r.next_hop.trim().parse::<Ipv4Addr>().ok() == Some(gateway)
+    }) {
+        return Ok(None);
+    }
+
     let route = RouteRecord {
         interface_index: upstream_if.if_index,
-        destination_prefix: format!("{ip}/32"),
+        destination_prefix: target_prefix,
         next_hop: gateway.to_string(),
         route_metric: 0,
         is_ipv6: false,
     };
     ops.add_route(&route)?;
-    Ok(route)
+    Ok(Some(route))
 }
 
 fn empty_recovery_entry(provider: VpnProvider) -> VpnRecoveryEntry {
@@ -534,7 +571,7 @@ fn should_neutralize_split_or_default_route(route: &RouteRecord) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Mutex;
 
     use super::*;
@@ -548,6 +585,9 @@ mod tests {
         warp_mode: Option<String>,
         warp_set_calls: Vec<String>,
         fail_remove_prefix: Option<String>,
+        vanished_interfaces: HashSet<u32>,
+        vanished_error_code: Option<u32>,
+        add_route_calls: Vec<RouteRecord>,
     }
 
     #[derive(Debug, Default)]
@@ -592,6 +632,19 @@ mod tests {
 
         fn set_fail_remove_prefix(&self, prefix: Option<&str>) {
             self.state.lock().unwrap().fail_remove_prefix = prefix.map(ToString::to_string);
+        }
+
+        fn mark_interface_vanished(&self, if_index: u32, error_code: u32) {
+            let mut guard = self.state.lock().unwrap();
+            guard.vanished_interfaces.insert(if_index);
+            guard.vanished_error_code = Some(error_code);
+            guard.routes.retain(|r| r.interface_index != if_index);
+            guard.metrics.remove(&(if_index, false));
+            guard.metrics.remove(&(if_index, true));
+        }
+
+        fn add_route_calls(&self) -> Vec<RouteRecord> {
+            self.state.lock().unwrap().add_route_calls.clone()
         }
 
         fn routes_for(&self, if_index: u32, is_ipv6: bool) -> Vec<RouteRecord> {
@@ -644,6 +697,15 @@ mod tests {
 
         fn add_route(&self, route: &RouteRecord) -> Result<(), NetOpsError> {
             let mut guard = self.state.lock().unwrap();
+            guard.add_route_calls.push(route.clone());
+            if guard.vanished_interfaces.contains(&route.interface_index) {
+                let code = guard.vanished_error_code.unwrap_or(1168);
+                return Err(NetOpsError::Win32 {
+                    operation: "CreateIpForwardEntry2",
+                    code,
+                    message: "Vanished interface.".to_string(),
+                });
+            }
             if guard.routes.iter().any(|r| {
                 r.interface_index == route.interface_index
                     && r.destination_prefix == route.destination_prefix
@@ -667,6 +729,14 @@ mod tests {
                     operation: "DeleteIpForwardEntry2",
                     code: 5,
                     message: "Access is denied.".to_string(),
+                });
+            }
+            if guard.vanished_interfaces.contains(&route.interface_index) {
+                let code = guard.vanished_error_code.unwrap_or(1168);
+                return Err(NetOpsError::Win32 {
+                    operation: "DeleteIpForwardEntry2",
+                    code,
+                    message: "Vanished interface.".to_string(),
                 });
             }
             let pos = guard.routes.iter().position(|r| {
@@ -713,6 +783,14 @@ mod tests {
             automatic_metric: bool,
         ) -> Result<(), NetOpsError> {
             let mut guard = self.state.lock().unwrap();
+            if guard.vanished_interfaces.contains(&interface_index) {
+                let code = guard.vanished_error_code.unwrap_or(1168);
+                return Err(NetOpsError::Win32 {
+                    operation: "SetIpInterfaceEntry",
+                    code,
+                    message: "Vanished interface.".to_string(),
+                });
+            }
             guard.metrics.insert(
                 (interface_index, is_ipv6),
                 InterfaceMetricSnapshot {
@@ -723,6 +801,11 @@ mod tests {
                 },
             );
             Ok(())
+        }
+
+        fn interface_exists(&self, interface_index: u32) -> Result<bool, NetOpsError> {
+            let guard = self.state.lock().unwrap();
+            Ok(!guard.vanished_interfaces.contains(&interface_index))
         }
 
         fn find_best_route_interface(&self, _dest_ipv4: &str) -> Result<Option<String>, NetOpsError> {
@@ -821,6 +904,7 @@ mod tests {
             detected_port: Some(3067),
             adapter_alias: Some("Karing TUN".to_string()),
             adapter_if_index: Some(karing_if),
+            adapter_is_up: true,
             adapter_gateway: Some("10.20.0.2".to_string()),
             remote_server_ip: None,
             warp_current_mode: None,
@@ -894,6 +978,7 @@ mod tests {
             detected_port: None,
             adapter_alias: Some("CloudflareWARP".to_string()),
             adapter_if_index: Some(warp_if),
+            adapter_is_up: true,
             adapter_gateway: None,
             remote_server_ip: None,
             warp_current_mode: Some("warp".to_string()),
@@ -936,6 +1021,7 @@ mod tests {
             detected_port: None,
             adapter_alias: Some("CloudflareWARP".to_string()),
             adapter_if_index: Some(warp_if),
+            adapter_is_up: true,
             adapter_gateway: None,
             remote_server_ip: None,
             warp_current_mode: Some("warp+doh".to_string()),
@@ -1010,6 +1096,7 @@ mod tests {
             detected_port: None,
             adapter_alias: Some("OpenVPN Data Channel Offload".to_string()),
             adapter_if_index: Some(ovpn_if),
+            adapter_is_up: true,
             adapter_gateway: None,
             remote_server_ip: Some("203.0.113.45".to_string()),
             warp_current_mode: None,
@@ -1055,7 +1142,8 @@ mod tests {
             resolved.openvpn_server_ip.as_deref().unwrap(),
             &upstream_if,
         )
-        .expect("pin DCO /32 host route");
+        .expect("pin DCO /32 host route")
+        .expect("new pinned route returned");
         assert_eq!(
             pinned,
             RouteRecord {
@@ -1086,6 +1174,7 @@ mod tests {
             detected_port: None,
             adapter_alias: None,
             adapter_if_index: None,
+            adapter_is_up: false,
             adapter_gateway: None,
             remote_server_ip: None,
             warp_current_mode: None,
@@ -1108,6 +1197,7 @@ mod tests {
             detected_port: Some(3067),
             adapter_alias: None,
             adapter_if_index: None,
+            adapter_is_up: false,
             adapter_gateway: None,
             remote_server_ip: None,
             warp_current_mode: None,
@@ -1135,6 +1225,7 @@ mod tests {
             detected_port: None,
             adapter_alias: Some("Detected OVPN".to_string()),
             adapter_if_index: None,
+            adapter_is_up: true,
             adapter_gateway: None,
             remote_server_ip: Some("198.51.100.10".to_string()),
             warp_current_mode: None,
@@ -1237,6 +1328,7 @@ mod tests {
             detected_port: None,
             adapter_alias: Some("OpenVPN Wintun".to_string()),
             adapter_if_index: Some(ovpn_if),
+            adapter_is_up: true,
             adapter_gateway: None,
             remote_server_ip: None,
             warp_current_mode: None,
@@ -1252,6 +1344,144 @@ mod tests {
         assert_eq!(
             entry.added_routes,
             vec![route(ovpn_if, "0.0.0.0/0", "0.0.0.0", 500, false)]
+        );
+    }
+
+    #[test]
+    fn test_pin_openvpn_dco_host_route_skips_preexisting_host_route() {
+        let phys_if = 7;
+        let existing_route = route(phys_if, "203.0.113.45/32", "192.168.1.1", 5, false);
+        let ops = MockNetworkOps::with_routes(vec![existing_route.clone()]);
+        let upstream_if = PhysicalInterfaceInfo {
+            alias: "Wi-Fi".to_string(),
+            description: "Wi-Fi".to_string(),
+            if_index: phys_if,
+            ipv4: Some("192.168.1.50".to_string()),
+            gateway_ipv4: Some("192.168.1.1".to_string()),
+            is_up: true,
+            link_speed_mbps: 866,
+            is_default_gateway: true,
+        };
+
+        let result = pin_openvpn_dco_host_route(&ops, "203.0.113.45", &upstream_if)
+            .expect("preexisting route should succeed");
+        assert_eq!(result, None);
+        assert!(
+            ops.add_route_calls().is_empty(),
+            "add_route must NOT be called when matching /32 route already exists"
+        );
+        assert_eq!(ops.routes_for(phys_if, false), vec![existing_route]);
+    }
+
+    #[test]
+    fn test_restore_vpn_tolerates_vanished_adapter_and_already_exists_but_reports_access_denied() {
+        // Vanished TUN adapter with ERROR_NOT_FOUND (1168) or ERROR_INVALID_PARAMETER (87)
+        for code in [1168u32, 2u32, 87u32] {
+            let vanished_if = 77;
+            let ops = MockNetworkOps::new();
+            ops.mark_interface_vanished(vanished_if, code);
+            let entry = VpnRecoveryEntry {
+                provider: VpnProvider::OpenVpn,
+                removed_routes: vec![route(vanished_if, "0.0.0.0/1", "10.8.0.1", 5, false)],
+                added_routes: vec![route(vanished_if, "0.0.0.0/0", "10.8.0.1", 500, false)],
+                metric_snapshots: vec![InterfaceMetricSnapshot {
+                    interface_index: vanished_if,
+                    is_ipv6: false,
+                    original_metric: 10,
+                    automatic_metric: false,
+                }],
+                warp_previous_mode: None,
+            };
+            restore_vpn(&ops, &entry).expect("vanished ephemeral TUN adapter must restore cleanly");
+        }
+
+        // Pre-existing removed_routes on live interface (ERROR_OBJECT_ALREADY_EXISTS = 5010)
+        let live_if = 33;
+        let existing_route = route(live_if, "0.0.0.0/1", "10.8.0.1", 5, false);
+        let ops_existing = MockNetworkOps::with_routes(vec![existing_route.clone()]);
+        ops_existing.set_metric(live_if, false, 500, false);
+        let entry_existing = VpnRecoveryEntry {
+            provider: VpnProvider::OpenVpn,
+            removed_routes: vec![existing_route],
+            added_routes: Vec::new(),
+            metric_snapshots: vec![InterfaceMetricSnapshot {
+                interface_index: live_if,
+                is_ipv6: false,
+                original_metric: 5,
+                automatic_metric: false,
+            }],
+            warp_previous_mode: None,
+        };
+        restore_vpn(&ops_existing, &entry_existing).expect("5010 already exists is tolerated");
+        assert_eq!(ops_existing.metric_for(live_if, false).original_metric, 5);
+
+        // Real error (Access Denied / 5) on an existing interface is NEVER swallowed
+        let ops_denied = MockNetworkOps::with_routes(vec![route(live_if, "0.0.0.0/0", "10.8.0.1", 500, false)]);
+        ops_denied.set_fail_remove_prefix(Some("0.0.0.0/0"));
+        let entry_denied = VpnRecoveryEntry {
+            provider: VpnProvider::OpenVpn,
+            removed_routes: Vec::new(),
+            added_routes: vec![route(live_if, "0.0.0.0/0", "10.8.0.1", 500, false)],
+            metric_snapshots: Vec::new(),
+            warp_previous_mode: None,
+        };
+        let err = restore_vpn(&ops_denied, &entry_denied).expect_err("Access Denied must be reported");
+        assert!(matches!(
+            err,
+            VpnAdapterError::NetOps(NetOpsError::Win32 { code: 5, .. })
+        ));
+    }
+
+    #[test]
+    fn test_preflight_rejects_disconnected_always_on_warp_and_openvpn_when_adapter_down() {
+        let warp_down = DetectedVpnInfo {
+            provider: VpnProvider::CloudflareWarp,
+            is_running: true, // simulates always-on warp-svc.exe running
+            detected_port: None,
+            adapter_alias: Some("CloudflareWARP".to_string()),
+            adapter_if_index: Some(40),
+            adapter_is_up: false,
+            adapter_gateway: None,
+            remote_server_ip: None,
+            warp_current_mode: Some("warp".to_string()),
+        };
+        assert_eq!(
+            preflight_and_resolve_vpn(
+                VpnProvider::CloudflareWarp,
+                &VpnNodeSettings {
+                    warp_mode: WarpMode::Tun,
+                    ..Default::default()
+                },
+                &warp_down
+            ),
+            Err(VpnAdapterError::NotRunning(VpnProvider::CloudflareWarp))
+        );
+        assert_eq!(
+            preflight_and_resolve_vpn(
+                VpnProvider::CloudflareWarp,
+                &VpnNodeSettings {
+                    warp_mode: WarpMode::Proxy,
+                    ..Default::default()
+                },
+                &warp_down
+            ),
+            Err(VpnAdapterError::NotRunning(VpnProvider::CloudflareWarp))
+        );
+
+        let ovpn_down = DetectedVpnInfo {
+            provider: VpnProvider::OpenVpn,
+            is_running: true, // simulates always-on ovpnconnector.exe running
+            detected_port: None,
+            adapter_alias: Some("OpenVPN Data Channel Offload".to_string()),
+            adapter_if_index: Some(30),
+            adapter_is_up: false,
+            adapter_gateway: None,
+            remote_server_ip: None,
+            warp_current_mode: None,
+        };
+        assert_eq!(
+            preflight_and_resolve_vpn(VpnProvider::OpenVpn, &VpnNodeSettings::default(), &ovpn_down),
+            Err(VpnAdapterError::NotRunning(VpnProvider::OpenVpn))
         );
     }
 }

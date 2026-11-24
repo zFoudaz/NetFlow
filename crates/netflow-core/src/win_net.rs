@@ -89,6 +89,12 @@ pub trait WindowsNetworkOps: Send + Sync {
     /// Looks up a network interface's `IfIndex` by its alias (`FriendlyName`), case-insensitively.
     fn find_interface_index_by_alias(&self, alias: &str) -> Result<Option<u32>, NetOpsError>;
 
+    /// Returns `true` if `interface_index` currently exists in the host IP stack.
+    fn interface_exists(&self, interface_index: u32) -> Result<bool, NetOpsError> {
+        let _ = interface_index;
+        Ok(true)
+    }
+
     /// Reads the current per-user Windows Internet Settings system proxy configuration.
     fn get_system_proxy(&self) -> Result<SystemProxySnapshot, NetOpsError>;
 
@@ -160,6 +166,10 @@ impl WindowsNetworkOps for Win32NetworkOps {
             .map(|a| a.if_index))
     }
 
+    fn interface_exists(&self, interface_index: u32) -> Result<bool, NetOpsError> {
+        platform::interface_exists(interface_index)
+    }
+
     fn get_system_proxy(&self) -> Result<SystemProxySnapshot, NetOpsError> {
         platform::get_system_proxy()
     }
@@ -178,6 +188,69 @@ impl WindowsNetworkOps for Win32NetworkOps {
 
     fn warp_cli_set_mode(&self, mode: &str) -> Result<(), NetOpsError> {
         warp_cli_set_mode_impl(mode)
+    }
+}
+
+pub(crate) const ERROR_FILE_NOT_FOUND_CODE: u32 = 2;
+pub(crate) const ERROR_INVALID_PARAMETER_CODE: u32 = 87;
+pub(crate) const ERROR_NOT_FOUND_CODE: u32 = 1168;
+pub(crate) const ERROR_OBJECT_ALREADY_EXISTS_CODE: u32 = 5010;
+
+fn is_vanished_interface_or_not_found(
+    ops: &dyn WindowsNetworkOps,
+    interface_index: u32,
+    code: u32,
+) -> bool {
+    if code == ERROR_NOT_FOUND_CODE || code == ERROR_FILE_NOT_FOUND_CODE {
+        return true;
+    }
+    if code == ERROR_INVALID_PARAMETER_CODE {
+        return !ops.interface_exists(interface_index).unwrap_or(true);
+    }
+    false
+}
+
+/// Returns `true` when removing a route failed solely because the route or adapter already vanished.
+pub(crate) fn is_benign_remove_route_error(
+    ops: &dyn WindowsNetworkOps,
+    interface_index: u32,
+    err: &NetOpsError,
+) -> bool {
+    match err {
+        NetOpsError::RouteNotFound { .. } => true,
+        NetOpsError::Win32 { code, .. } => {
+            is_vanished_interface_or_not_found(ops, interface_index, *code)
+        }
+        _ => false,
+    }
+}
+
+/// Returns `true` when restoring an interface metric failed solely because the adapter vanished.
+pub(crate) fn is_benign_restore_metric_error(
+    ops: &dyn WindowsNetworkOps,
+    interface_index: u32,
+    err: &NetOpsError,
+) -> bool {
+    match err {
+        NetOpsError::Win32 { code, .. } => {
+            is_vanished_interface_or_not_found(ops, interface_index, *code)
+        }
+        _ => false,
+    }
+}
+
+/// Returns `true` when re-adding a route during recovery failed because it already exists or the adapter vanished.
+pub(crate) fn is_benign_restore_add_route_error(
+    ops: &dyn WindowsNetworkOps,
+    interface_index: u32,
+    err: &NetOpsError,
+) -> bool {
+    match err {
+        NetOpsError::Win32 { code, .. } => {
+            *code == ERROR_OBJECT_ALREADY_EXISTS_CODE
+                || is_vanished_interface_or_not_found(ops, interface_index, *code)
+        }
+        _ => false,
     }
 }
 
@@ -343,8 +416,8 @@ pub(crate) mod platform {
 
     use windows::core::{HRESULT, PCWSTR};
     use windows::Win32::Foundation::{
-        BOOLEAN, ERROR_BUFFER_OVERFLOW, ERROR_FILE_NOT_FOUND, ERROR_NETWORK_UNREACHABLE,
-        ERROR_NOT_FOUND, NO_ERROR, WIN32_ERROR,
+        BOOLEAN, ERROR_BUFFER_OVERFLOW, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER,
+        ERROR_NETWORK_UNREACHABLE, ERROR_NOT_FOUND, NO_ERROR, WIN32_ERROR,
     };
     use windows::Win32::NetworkManagement::IpHelper::{
         ConvertInterfaceIndexToLuid, ConvertInterfaceLuidToAlias, CreateIpForwardEntry2,
@@ -669,6 +742,21 @@ pub(crate) mod platform {
             return Err(err_from_win32("SetIpInterfaceEntry", set_status));
         }
         Ok(())
+    }
+
+    pub(crate) fn interface_exists(interface_index: u32) -> Result<bool, NetOpsError> {
+        let mut luid = NET_LUID_LH::default();
+        let status = unsafe { ConvertInterfaceIndexToLuid(interface_index, &mut luid) };
+        if status == NO_ERROR {
+            Ok(true)
+        } else if matches!(
+            status,
+            ERROR_NOT_FOUND | ERROR_FILE_NOT_FOUND | ERROR_INVALID_PARAMETER
+        ) {
+            Ok(false)
+        } else {
+            Err(err_from_win32("ConvertInterfaceIndexToLuid", status))
+        }
     }
 
     pub(crate) fn find_best_route_interface(
@@ -1069,6 +1157,10 @@ pub(crate) mod platform {
         Err(NetOpsError::UnsupportedPlatform)
     }
 
+    pub(crate) fn interface_exists(_: u32) -> Result<bool, NetOpsError> {
+        Err(NetOpsError::UnsupportedPlatform)
+    }
+
     pub(crate) fn enumerate_adapters() -> Result<Vec<RawAdapterInfo>, NetOpsError> {
         Err(NetOpsError::UnsupportedPlatform)
     }
@@ -1245,5 +1337,107 @@ mod tests {
         };
         ops.restore_interface_metric(&snap).expect("restore");
         assert_eq!(ops.0.lock().unwrap().as_slice(), &[(8, false, 40, true)]);
+    }
+
+    #[test]
+    fn test_benign_recovery_error_classification() {
+        struct ExistenceOps(u32);
+
+        impl WindowsNetworkOps for ExistenceOps {
+            fn list_routes(&self, _: Option<u32>, _: bool) -> Result<Vec<RouteRecord>, NetOpsError> {
+                Ok(Vec::new())
+            }
+            fn add_route(&self, _: &RouteRecord) -> Result<(), NetOpsError> {
+                Ok(())
+            }
+            fn remove_route(&self, _: &RouteRecord) -> Result<(), NetOpsError> {
+                Ok(())
+            }
+            fn get_interface_metric(&self, _: u32, _: bool) -> Result<InterfaceMetricSnapshot, NetOpsError> {
+                Err(NetOpsError::UnsupportedPlatform)
+            }
+            fn set_interface_metric(&self, _: u32, _: bool, _: u32, _: bool) -> Result<(), NetOpsError> {
+                Ok(())
+            }
+            fn find_best_route_interface(&self, _: &str) -> Result<Option<String>, NetOpsError> {
+                Ok(None)
+            }
+            fn find_interface_index_by_alias(&self, _: &str) -> Result<Option<u32>, NetOpsError> {
+                Ok(None)
+            }
+            fn interface_exists(&self, interface_index: u32) -> Result<bool, NetOpsError> {
+                Ok(interface_index == self.0)
+            }
+            fn get_system_proxy(&self) -> Result<SystemProxySnapshot, NetOpsError> {
+                Err(NetOpsError::UnsupportedPlatform)
+            }
+            fn set_system_proxy(&self, _: &SystemProxySnapshot) -> Result<(), NetOpsError> {
+                Ok(())
+            }
+            fn disable_system_proxy(&self) -> Result<(), NetOpsError> {
+                Ok(())
+            }
+            fn warp_cli_get_mode(&self) -> Result<Option<String>, NetOpsError> {
+                Ok(None)
+            }
+            fn warp_cli_set_mode(&self, _: &str) -> Result<(), NetOpsError> {
+                Ok(())
+            }
+        }
+
+        let ops = ExistenceOps(12);
+        let err_1168 = NetOpsError::Win32 {
+            operation: "DeleteIpForwardEntry2",
+            code: 1168,
+            message: "not found".to_string(),
+        };
+        let err_2 = NetOpsError::Win32 {
+            operation: "DeleteIpForwardEntry2",
+            code: 2,
+            message: "file not found".to_string(),
+        };
+        let err_87 = NetOpsError::Win32 {
+            operation: "SetIpInterfaceEntry",
+            code: 87,
+            message: "invalid parameter".to_string(),
+        };
+        let err_5010 = NetOpsError::Win32 {
+            operation: "CreateIpForwardEntry2",
+            code: 5010,
+            message: "already exists".to_string(),
+        };
+        let err_5 = NetOpsError::Win32 {
+            operation: "DeleteIpForwardEntry2",
+            code: 5,
+            message: "access denied".to_string(),
+        };
+
+        assert!(is_benign_remove_route_error(
+            &ops,
+            99,
+            &NetOpsError::RouteNotFound {
+                interface_index: 99,
+                prefix: "0.0.0.0/0".to_string(),
+                next_hop: "0.0.0.0".to_string(),
+            }
+        ));
+        assert!(is_benign_remove_route_error(&ops, 99, &err_1168));
+        assert!(is_benign_remove_route_error(&ops, 99, &err_2));
+        assert!(is_benign_remove_route_error(&ops, 99, &err_87));
+        assert!(!is_benign_remove_route_error(&ops, 12, &err_87));
+        assert!(!is_benign_remove_route_error(&ops, 99, &err_5));
+
+        assert!(is_benign_restore_metric_error(&ops, 99, &err_1168));
+        assert!(is_benign_restore_metric_error(&ops, 99, &err_2));
+        assert!(is_benign_restore_metric_error(&ops, 99, &err_87));
+        assert!(!is_benign_restore_metric_error(&ops, 12, &err_87));
+        assert!(!is_benign_restore_metric_error(&ops, 99, &err_5));
+
+        assert!(is_benign_restore_add_route_error(&ops, 12, &err_5010));
+        assert!(is_benign_restore_add_route_error(&ops, 99, &err_1168));
+        assert!(is_benign_restore_add_route_error(&ops, 99, &err_2));
+        assert!(is_benign_restore_add_route_error(&ops, 99, &err_87));
+        assert!(!is_benign_restore_add_route_error(&ops, 12, &err_87));
+        assert!(!is_benign_restore_add_route_error(&ops, 99, &err_5));
     }
 }

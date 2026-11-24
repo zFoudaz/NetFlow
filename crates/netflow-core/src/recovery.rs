@@ -77,6 +77,10 @@ pub struct RecoverySnapshot {
     pub system_proxy: Option<SystemProxySnapshot>,
     pub vpn_entries: HashMap<VpnProvider, VpnRecoveryEntry>,
     pub pinned_host_routes: Vec<RouteRecord>,
+    #[serde(default)]
+    pub removed_bypass_routes: Vec<RouteRecord>,
+    #[serde(default)]
+    pub singbox_pid: Option<u32>,
 }
 
 impl RecoverySnapshot {
@@ -260,6 +264,14 @@ mod tests {
                 route_metric: 15,
                 is_ipv6: false,
             }],
+            removed_bypass_routes: vec![RouteRecord {
+                interface_index: 7,
+                destination_prefix: "203.0.113.10/32".to_string(),
+                next_hop: "192.168.1.1".to_string(),
+                route_metric: 5,
+                is_ipv6: false,
+            }],
+            singbox_pid: Some(4242),
         };
 
         store.save_atomic(&snapshot).expect("save atomic");
@@ -271,6 +283,8 @@ mod tests {
         assert!(raw.contains("\"systemProxy\""));
         assert!(raw.contains("\"vpnEntries\""));
         assert!(raw.contains("\"pinnedHostRoutes\""));
+        assert!(raw.contains("\"removedBypassRoutes\""));
+        assert!(raw.contains("\"singboxPid\""));
         assert!(raw.contains("\"warpPreviousMode\""));
         assert!(raw.contains("\"automaticMetric\""));
 
@@ -305,6 +319,8 @@ mod tests {
             system_proxy: None,
             vpn_entries: HashMap::new(),
             pinned_host_routes: Vec::new(),
+            removed_bypass_routes: Vec::new(),
+            singbox_pid: None,
         };
 
         let baseline_karing = VpnRecoveryEntry {
@@ -400,5 +416,18 @@ mod tests {
         assert!(len >= 2);
         assert_eq!(components[len - 2], "NetFlow");
         assert_eq!(components[len - 1], "recovery.json");
+    }
+
+    #[test]
+    fn test_recovery_snapshot_defaults_optional_fields_from_legacy_json() {
+        let legacy = r#"{
+            "createdAt": "2026-11-24T01:00:00Z",
+            "systemProxy": null,
+            "vpnEntries": {},
+            "pinnedHostRoutes": []
+        }"#;
+        let parsed: RecoverySnapshot = serde_json::from_str(legacy).expect("parse legacy snapshot");
+        assert_eq!(parsed.singbox_pid, None);
+        assert!(parsed.removed_bypass_routes.is_empty());
     }
 }

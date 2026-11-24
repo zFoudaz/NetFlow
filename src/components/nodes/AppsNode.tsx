@@ -3,7 +3,7 @@ import { AppWindow, Trash2, X } from "lucide-react";
 import { useState } from "react";
 import { useNetFlowStore } from "../../store/useNetFlowStore";
 import type { WorkflowNode } from "../../types/workflow";
-import { AddAppModal } from "../AddAppModal";
+import { AddAppModal, normalizeExeBasename } from "../AddAppModal";
 import {
   getNodeCardBorderClass,
   NodeErrorCallout,
@@ -27,8 +27,8 @@ export function AppsNode({ data, selected }: NodeProps<AppsFlowNode>) {
   const { apps } = wfNode.kind;
 
   const handleAddApp = (exeName: string) => {
-    const normalized = exeName.toLowerCase();
-    if (!apps.some((app) => app.toLowerCase() === normalized)) {
+    const normalized = normalizeExeBasename(exeName) ?? exeName.toLowerCase();
+    if (!apps.some((app) => (normalizeExeBasename(app) ?? app.toLowerCase()) === normalized)) {
       updateNodeApps(wfNode.id, [...apps, normalized]);
     }
   };

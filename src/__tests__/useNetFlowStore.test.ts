@@ -164,11 +164,36 @@ describe("useNetFlowStore", () => {
 
     expect(result).toEqual({ switched: true, needsConfirm: false });
     expect(mockTauri.stopRouting).not.toHaveBeenCalled();
+    expect(mockTauri.validateWorkflowGraph).toHaveBeenCalledTimes(1);
+    expect(mockTauri.validateWorkflowGraph).toHaveBeenCalledWith(wfB.graph);
     expect(mockTauri.applyWorkflow).toHaveBeenCalledTimes(1);
     expect(mockTauri.applyWorkflow).toHaveBeenCalledWith("wf-b", wfB.graph);
     expect(useNetFlowStore.getState().currentWorkflowId).toBe("wf-b");
     expect(useNetFlowStore.getState().engineStatus.activeWorkflowId).toBe("wf-b");
     expect(useNetFlowStore.getState().engineStatus.state).toBe("active");
+  });
+
+  it("test_switch_and_apply_validates_target_workflow_before_applying", async () => {
+    mockTauri.listWorkflows.mockResolvedValue([wfA, wfB]);
+    await useNetFlowStore.getState().loadWorkflows();
+    useNetFlowStore.setState({ engineStatus: activeStatus("wf-a") });
+
+    const errors: ValidationError[] = [
+      {
+        code: "missingUpstreamInterface",
+        nodeIds: ["iface-eth"],
+        message: "Target workflow is invalid.",
+      },
+    ];
+    mockTauri.validateWorkflowGraph.mockRejectedValueOnce(errors);
+
+    const result = await useNetFlowStore.getState().switchAndApplyWorkflow("wf-b");
+    expect(result).toEqual({ switched: true, needsConfirm: false });
+    expect(mockTauri.validateWorkflowGraph).toHaveBeenCalledWith(wfB.graph);
+    expect(mockTauri.applyWorkflow).not.toHaveBeenCalled();
+    expect(useNetFlowStore.getState().validationErrors).toEqual(errors);
+    expect(useNetFlowStore.getState().uiError).toBe("Target workflow is invalid.");
+    expect(useNetFlowStore.getState().isApplying).toBe(false);
   });
 
   it("test_deleting_active_workflow_stops_or_blocks_cleanly", async () => {

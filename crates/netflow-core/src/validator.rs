@@ -8,7 +8,8 @@ use crate::model::{
 /// Normalizes an executable name or path into a lowercase executable filename.
 ///
 /// Trims surrounding whitespace, extracts the filename component if a path with `/` or `\`
-/// separators is supplied, lowercases it, and rejects empty, dot-only, or illegal filenames.
+/// separators is supplied, lowercases it, and rejects empty, dot-only, trailing-dot,
+/// stemless `.exe`, or illegal filenames.
 pub fn normalize_exe_name(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -27,7 +28,30 @@ pub fn normalize_exe_name(raw: &str) -> Option<String> {
         return None;
     }
 
-    Some(filename.to_lowercase())
+    let lower = filename.to_lowercase();
+    if lower.ends_with('.') {
+        return None;
+    }
+
+    let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
+    if stem
+        .trim_matches(|c: char| c == '.' || c.is_whitespace())
+        .is_empty()
+    {
+        return None;
+    }
+
+    Some(lower)
+}
+
+/// Normalizes an executable name or path and guarantees a canonical lowercase `.exe` suffix.
+pub fn canonicalize_exe_name(raw: &str) -> Option<String> {
+    let normalized = normalize_exe_name(raw)?;
+    if normalized.ends_with(".exe") {
+        Some(normalized)
+    } else {
+        Some(format!("{normalized}.exe"))
+    }
 }
 
 /// Validates a `WorkflowGraph`, collecting all structural and semantic errors before
@@ -491,7 +515,7 @@ fn validate_apps(
         };
 
         for raw_app in apps {
-            let Some(exe_name) = normalize_exe_name(raw_app) else {
+            let Some(exe_name) = canonicalize_exe_name(raw_app) else {
                 push_error(
                     errors,
                     ValidationErrorCode::InvalidAppName,
@@ -994,6 +1018,60 @@ mod tests {
         assert_eq!(normalize_exe_name(r"C:\folder\"), None);
         assert_eq!(normalize_exe_name("bad*name.exe"), None);
         assert_eq!(normalize_exe_name(".."), None);
+        assert_eq!(normalize_exe_name(".exe"), None);
+        assert_eq!(normalize_exe_name(" .EXE "), None);
+        assert_eq!(normalize_exe_name(r"C:\Tools\.exe"), None);
+        assert_eq!(normalize_exe_name("chrome."), None);
+        assert_eq!(normalize_exe_name("..exe"), None);
+
+        // "chrome" vs "chrome.exe" across two Apps nodes must be caught as DuplicateAppAssignment
+        let canonical_dup_graph = WorkflowGraph {
+            nodes: vec![
+                iface_node("if-wifi", "Wi-Fi", false),
+                iface_node("if-lan", "LAN 1", false),
+                apps_node("apps-a", &["chrome"]),
+                apps_node("apps-b", &["CHROME.EXE"]),
+            ],
+            edges: vec![
+                edge("e1", "if-wifi", "apps-a"),
+                edge("e2", "if-lan", "apps-b"),
+            ],
+        };
+        let dup_errors =
+            validate_graph(&canonical_dup_graph).expect_err("chrome vs chrome.exe must collide");
+        assert!(dup_errors
+            .iter()
+            .any(|e| e.code == ValidationErrorCode::DuplicateAppAssignment));
+
+        // Stemless ".exe" and trailing-dot names fail validation with InvalidAppName
+        let stemless_graph = WorkflowGraph {
+            nodes: vec![
+                iface_node("if-wifi", "Wi-Fi", false),
+                apps_node("apps-a", &[".exe", "firefox."]),
+            ],
+            edges: vec![edge("e1", "if-wifi", "apps-a")],
+        };
+        let invalid_errors =
+            validate_graph(&stemless_graph).expect_err("stemless .exe must fail");
+        assert_eq!(
+            invalid_errors
+                .iter()
+                .filter(|e| e.code == ValidationErrorCode::InvalidAppName)
+                .count(),
+            2
+        );
+
+        // Un-suffixed "chrome" is stored canonically as "chrome.exe" in ValidatedGraph.app_routes
+        let unsuffixed_valid = WorkflowGraph {
+            nodes: vec![
+                iface_node("if-wifi", "Wi-Fi", false),
+                apps_node("apps-a", &[" Chrome "]),
+            ],
+            edges: vec![edge("e1", "if-wifi", "apps-a")],
+        };
+        let validated = validate_graph(&unsuffixed_valid).expect("unsuffixed chrome validates");
+        assert!(validated.app_routes.contains_key("chrome.exe"));
+        assert_eq!(validated.app_routes["chrome.exe"].exe_name, "chrome.exe");
     }
 
     #[test]

@@ -485,18 +485,7 @@ export const useNetFlowStore = create<NetFlowStoreState>((set, get) => ({
       return selection;
     }
 
-    const target = get().workflows.find((w) => w.id === id);
-    if (!target) {
-      return { switched: false, needsConfirm: false };
-    }
-
-    set({ isApplying: true, uiError: null });
-    try {
-      const status = await tauri.applyWorkflow(target.id, target.graph);
-      set({ engineStatus: status, isApplying: false, uiError: null });
-    } catch (err) {
-      set({ isApplying: false, uiError: formatError(err) });
-    }
+    await get().applyCurrentWorkflow();
     return selection;
   },
 

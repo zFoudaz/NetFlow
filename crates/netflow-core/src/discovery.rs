@@ -45,6 +45,8 @@ pub struct DetectedVpnInfo {
     pub detected_port: Option<u16>,
     pub adapter_alias: Option<String>,
     pub adapter_if_index: Option<u32>,
+    #[serde(default)]
+    pub adapter_is_up: bool,
     pub adapter_gateway: Option<String>,
     pub remote_server_ip: Option<String>,
     pub warp_current_mode: Option<String>,
@@ -401,7 +403,7 @@ fn find_matching_adapter(
     adapters
         .iter()
         .filter(|a| predicate(&a.alias, &a.description))
-        .max_by_key(|a| (a.is_up, a.gateway_ipv4.is_some()))
+        .max_by_key(|a| (a.is_up, a.gateway_ipv4.is_some(), a.ipv4.is_some()))
 }
 
 fn resolve_adapter_gateway(
@@ -445,8 +447,9 @@ fn detect_karing(
     running_exe_set: &HashSet<String>,
     ports_by_exe: &HashMap<String, Vec<u16>>,
 ) -> DetectedVpnInfo {
-    let is_running = has_any_process(running_exe_set, &["karingservice.exe", "karing.exe"]);
+    let process_running = has_any_process(running_exe_set, &["karingservice.exe", "karing.exe"]);
     let adapter = find_matching_adapter(adapters, is_karing_adapter);
+    let adapter_is_up = adapter.is_some_and(|a| a.is_up);
     let detected_port = ports_by_exe
         .get("karingservice.exe")
         .and_then(|ports| pick_karing_mixed_port(ports))
@@ -455,6 +458,7 @@ fn detect_karing(
                 .get("karing.exe")
                 .and_then(|ports| pick_karing_mixed_port(ports))
         });
+    let is_running = process_running && detected_port.is_some();
 
     DetectedVpnInfo {
         provider: VpnProvider::Karing,
@@ -462,6 +466,7 @@ fn detect_karing(
         detected_port,
         adapter_alias: adapter.map(|a| a.alias.clone()),
         adapter_if_index: adapter.map(|a| a.if_index),
+        adapter_is_up,
         adapter_gateway: resolve_adapter_gateway(adapter, ipv4_routes),
         remote_server_ip: None,
         warp_current_mode: None,
@@ -475,9 +480,10 @@ fn detect_warp(
     running_exe_set: &HashSet<String>,
     ports_by_exe: &HashMap<String, Vec<u16>>,
 ) -> DetectedVpnInfo {
-    let is_running = has_any_process(running_exe_set, &["warp-svc.exe"]);
+    let process_running = has_any_process(running_exe_set, &["warp-svc.exe"]);
     let adapter = find_matching_adapter(adapters, is_warp_adapter);
-    let warp_current_mode = if is_running || adapter.is_some() {
+    let adapter_is_up = adapter.is_some_and(|a| a.is_up);
+    let warp_current_mode = if process_running || adapter.is_some() {
         net_ops.warp_cli_get_mode().ok().flatten()
     } else {
         None
@@ -487,10 +493,12 @@ fn detect_warp(
         ports_by_exe
             .get("warp-svc.exe")
             .and_then(|ports| pick_port_preferring(ports, 40000))
-            .or(Some(40000))
     } else {
         None
     };
+    let is_running = process_running
+        && (adapter_is_up
+            || (warp_current_mode.as_deref() == Some("proxy") && detected_port.is_some()));
 
     DetectedVpnInfo {
         provider: VpnProvider::CloudflareWarp,
@@ -498,6 +506,7 @@ fn detect_warp(
         detected_port,
         adapter_alias: adapter.map(|a| a.alias.clone()),
         adapter_if_index: adapter.map(|a| a.if_index),
+        adapter_is_up,
         adapter_gateway: resolve_adapter_gateway(adapter, ipv4_routes),
         remote_server_ip: None,
         warp_current_mode,
@@ -510,9 +519,11 @@ fn detect_openvpn(
     running_exe_set: &HashSet<String>,
     physical_interfaces: &[PhysicalInterfaceInfo],
 ) -> DetectedVpnInfo {
-    let is_running = has_any_process(running_exe_set, &["openvpn.exe", "ovpnconnector.exe"]);
+    let process_running = has_any_process(running_exe_set, &["openvpn.exe", "ovpnconnector.exe"]);
     let adapter = find_matching_adapter(adapters, is_openvpn_adapter);
-    let remote_server_ip = if is_running || adapter.is_some_and(|a| a.is_up) {
+    let adapter_is_up = adapter.is_some_and(|a| a.is_up);
+    let is_running = process_running && adapter_is_up;
+    let remote_server_ip = if is_running {
         extract_openvpn_remote_server_ip(
             ipv4_routes,
             adapter.map(|a| a.if_index),
@@ -528,6 +539,7 @@ fn detect_openvpn(
         detected_port: None,
         adapter_alias: adapter.map(|a| a.alias.clone()),
         adapter_if_index: adapter.map(|a| a.if_index),
+        adapter_is_up,
         adapter_gateway: resolve_adapter_gateway(adapter, ipv4_routes),
         remote_server_ip,
         warp_current_mode: None,
@@ -1188,21 +1200,114 @@ mod tests {
 
         let karing = detect_karing(&adapters, &routes, &running, &ports);
         assert!(karing.is_running);
+        assert!(karing.adapter_is_up);
         assert_eq!(karing.detected_port, Some(3067));
         assert_eq!(karing.adapter_if_index, Some(41));
         assert_eq!(karing.adapter_gateway.as_deref(), Some("10.20.0.2"));
 
         let warp = detect_warp(&StubWarpOps(Some("proxy".to_string())), &adapters, &routes, &running, &ports);
         assert!(warp.is_running);
+        assert!(warp.adapter_is_up);
         assert_eq!(warp.warp_current_mode.as_deref(), Some("proxy"));
         assert_eq!(warp.detected_port, Some(40000));
         assert_eq!(warp.adapter_gateway.as_deref(), Some("172.16.0.1"));
 
         let openvpn = detect_openvpn(&adapters, &routes, &running, &physical);
         assert!(openvpn.is_running);
+        assert!(openvpn.adapter_is_up);
         assert_eq!(openvpn.adapter_if_index, Some(22));
         assert_eq!(openvpn.adapter_gateway.as_deref(), Some("10.8.0.1"));
         assert_eq!(openvpn.remote_server_ip.as_deref(), Some("198.51.100.42"));
+    }
+
+    #[test]
+    fn test_always_on_services_without_live_tunnel_are_reported_disconnected() {
+        let down_adapters = vec![
+            AdapterSpec {
+                alias: "CloudflareWARP",
+                description: "Cloudflare WARP WireGuard Tunnel",
+                if_index: 44,
+                if_type: 53,
+                is_up: false,
+                ipv4: None,
+                gateway_ipv4: None,
+                link_speed_bps: 0,
+                ipv4_metric: 5,
+            }
+            .build(),
+            AdapterSpec {
+                alias: "OpenVPN Data Channel Offload",
+                description: "OpenVPN Data Channel Offload",
+                if_index: 22,
+                if_type: 53,
+                is_up: false,
+                ipv4: None,
+                gateway_ipv4: None,
+                link_speed_bps: 0,
+                ipv4_metric: 5,
+            }
+            .build(),
+            AdapterSpec {
+                alias: "OpenVPN Wintun",
+                description: "OpenVPN Wintun",
+                if_index: 25,
+                if_type: 53,
+                is_up: true,
+                ipv4: Some("10.8.0.2"),
+                gateway_ipv4: Some("10.8.0.1"),
+                link_speed_bps: 1_000_000_000,
+                ipv4_metric: 5,
+            }
+            .build(),
+        ];
+
+        let running: HashSet<String> = ["karingservice.exe", "warp-svc.exe", "ovpnconnector.exe"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let empty_ports = HashMap::new();
+
+        // Karing service running with only control ports (no SOCKS/Mixed port) -> not running
+        let mut control_only_ports = HashMap::new();
+        control_only_ports.insert("karingservice.exe".to_string(), vec![5848, 3057]);
+        let karing = detect_karing(&down_adapters, &[], &running, &control_only_ports);
+        assert!(!karing.is_running);
+        assert_eq!(karing.detected_port, None);
+
+        // WARP in "proxy" mode with no listening socket does NOT fabricate 40000 and is not running
+        let warp_proxy_disconnected = detect_warp(
+            &StubWarpOps(Some("proxy".to_string())),
+            &down_adapters,
+            &[],
+            &running,
+            &empty_ports,
+        );
+        assert!(!warp_proxy_disconnected.is_running);
+        assert_eq!(warp_proxy_disconnected.detected_port, None);
+        assert!(!warp_proxy_disconnected.adapter_is_up);
+
+        // WARP in "warp" TUN mode with adapter down -> not running
+        let warp_tun_disconnected = detect_warp(
+            &StubWarpOps(Some("warp".to_string())),
+            &down_adapters,
+            &[],
+            &running,
+            &empty_ports,
+        );
+        assert!(!warp_tun_disconnected.is_running);
+        assert!(!warp_tun_disconnected.adapter_is_up);
+
+        // OpenVPN prefers the is_up == true adapter over the down DCO adapter
+        let openvpn_up = detect_openvpn(&down_adapters, &[], &running, &[]);
+        assert!(openvpn_up.is_running);
+        assert!(openvpn_up.adapter_is_up);
+        assert_eq!(openvpn_up.adapter_if_index, Some(25));
+
+        // OpenVPN with only down adapter -> not running even when ovpnconnector.exe is running
+        let down_only_ovpn = vec![down_adapters[1].clone()];
+        let openvpn_down = detect_openvpn(&down_only_ovpn, &[], &running, &[]);
+        assert!(!openvpn_down.is_running);
+        assert!(!openvpn_down.adapter_is_up);
     }
 
     #[cfg(windows)]
@@ -1246,7 +1351,7 @@ mod tests {
                 .iter()
                 .find(|v| v.provider == VpnProvider::Karing)
                 .expect("karing entry");
-            assert!(karing.is_running);
+            assert_eq!(karing.is_running, karing.detected_port.is_some());
         }
     }
 }

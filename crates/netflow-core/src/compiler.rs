@@ -7,7 +7,7 @@ use serde_json::{json, Map, Value};
 use thiserror::Error;
 
 use crate::model::{NodeKind, ValidatedGraph, ValidatedVpnChain, VpnProvider, WarpMode};
-use crate::validator::normalize_exe_name;
+use crate::validator::canonicalize_exe_name as canonicalize_validator_exe_name;
 
 const TUN_TAG: &str = "NetFlow-TUN";
 const TUN_INET4_ADDR: &str = "172.19.0.1/30";
@@ -702,14 +702,9 @@ fn normalize_ipv4_host_cidr(raw: &str) -> Result<String, CompileError> {
 }
 
 fn canonicalize_exe_name(raw: &str) -> Result<String, CompileError> {
-    let normalized = normalize_exe_name(raw).ok_or_else(|| CompileError::InvalidAppName {
+    canonicalize_validator_exe_name(raw).ok_or_else(|| CompileError::InvalidAppName {
         raw: raw.to_string(),
-    })?;
-    if normalized.ends_with(".exe") {
-        Ok(normalized)
-    } else {
-        Ok(format!("{normalized}.exe"))
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1208,6 +1203,15 @@ mod tests {
         assert!(observed_exes.contains(&"notepad.exe".to_string()));
         assert!(observed_exes.contains(&"karingservice.exe".to_string()));
         assert!(observed_exes.contains(&"karing.exe".to_string()));
+
+        assert!(matches!(
+            canonicalize_exe_name(".exe"),
+            Err(CompileError::InvalidAppName { .. })
+        ));
+        assert!(matches!(
+            canonicalize_exe_name("chrome."),
+            Err(CompileError::InvalidAppName { .. })
+        ));
     }
 
     fn assert_passes_real_singbox_check(config: &Value) {

@@ -86,6 +86,7 @@ export interface DetectedVpnInfo {
   detectedPort: number | null;
   adapterAlias: string | null;
   adapterIfIndex: number | null;
+  adapterIsUp: boolean;
   adapterGateway: string | null;
   remoteServerIp: string | null;
   warpCurrentMode: string | null;

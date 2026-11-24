@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -16,7 +17,8 @@ use crate::discovery::{
     DetectedVpnInfo, DiscoveryError, DiscoverySnapshot, PhysicalInterfaceInfo, SystemDiscovery,
 };
 use crate::model::{
-    NodeKind, ValidatedGraph, ValidationError, VpnProvider, WarpMode, WorkflowGraph,
+    NodeKind, ValidatedGraph, ValidatedVpnChain, ValidationError, VpnProvider, WarpMode,
+    WorkflowGraph,
 };
 use crate::recovery::{
     RecoveryError, RecoverySnapshot, RecoveryStore, RouteRecord, VpnRecoveryEntry,
@@ -28,13 +30,15 @@ use crate::vpn_adapters::{
     neutralize_vpn, pin_openvpn_dco_host_route, preflight_and_resolve_vpn, restore_vpn,
     VpnAdapterError,
 };
-use crate::win_net::{NetOpsError, WindowsNetworkOps};
+use crate::win_net::{
+    is_benign_remove_route_error, is_benign_restore_add_route_error, NetOpsError,
+    WindowsNetworkOps, ERROR_OBJECT_ALREADY_EXISTS_CODE,
+};
 
 const TUN_INTERFACE_ALIAS: &str = "NetFlow-TUN";
 const TUN_GATEWAY_IPV4: &str = "172.19.0.2";
-const DEFAULT_CLASH_API_PORT: u16 = 9090;
-const ERROR_NOT_FOUND_CODE: u32 = 1168;
-const ERROR_OBJECT_ALREADY_EXISTS_CODE: u32 = 5010;
+const DEFAULT_CLASH_API_PORT: u16 = 0;
+const FALLBACK_CLASH_API_PORT: u16 = 19090;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -110,15 +114,42 @@ pub trait SidecarRunner: Send + Sync {
     fn spawn(&self, config_path: &Path) -> Result<(), SidecarError>;
     /// Returns `true` if the managed `sing-box` process is currently running.
     fn is_alive(&self) -> bool;
+    /// Returns the OS process ID of the currently running managed `sing-box` child, if any.
+    fn pid(&self) -> Option<u32>;
     /// Terminates the managed `sing-box` process if it is running.
     fn kill(&self) -> Result<(), SidecarError>;
+    /// Terminates an orphaned `sing-box` process by PID after verifying its executable image name.
+    fn kill_pid(&self, pid: u32) -> Result<(), RuntimeError>;
+}
+
+#[cfg(windows)]
+struct JobHandle(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+unsafe impl Send for JobHandle {}
+
+#[cfg(windows)]
+impl Drop for JobHandle {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+struct ManagedChild {
+    child: Child,
+    #[cfg(windows)]
+    _job: Option<JobHandle>,
 }
 
 /// Real OS process runner for `sing-box.exe`.
 pub struct SingBoxSidecar {
     binary_path: PathBuf,
     wintun_dir: PathBuf,
-    child: Mutex<Option<Child>>,
+    child: Mutex<Option<ManagedChild>>,
 }
 
 impl SingBoxSidecar {
@@ -153,7 +184,7 @@ impl SidecarRunner for SingBoxSidecar {
 
         let mut guard = self.child.lock().expect("sidecar child mutex poisoned");
         if let Some(mut existing) = guard.take() {
-            terminate_child(&mut existing)?;
+            terminate_child(&mut existing.child)?;
         }
 
         let mut cmd = Command::new(&self.binary_path);
@@ -178,16 +209,29 @@ impl SidecarRunner for SingBoxSidecar {
             return Err(SidecarError::ExitedImmediately(status.to_string()));
         }
 
-        *guard = Some(child);
+        #[cfg(windows)]
+        let job = match attach_kill_on_close_job(&child) {
+            Ok(job) => Some(job),
+            Err(err) => {
+                let _ = terminate_child(&mut child);
+                return Err(err);
+            }
+        };
+
+        *guard = Some(ManagedChild {
+            child,
+            #[cfg(windows)]
+            _job: job,
+        });
         Ok(())
     }
 
     fn is_alive(&self) -> bool {
         let mut guard = self.child.lock().expect("sidecar child mutex poisoned");
-        let Some(child) = guard.as_mut() else {
+        let Some(managed) = guard.as_mut() else {
             return false;
         };
-        match child.try_wait() {
+        match managed.child.try_wait() {
             Ok(None) => true,
             _ => {
                 *guard = None;
@@ -196,13 +240,208 @@ impl SidecarRunner for SingBoxSidecar {
         }
     }
 
+    fn pid(&self) -> Option<u32> {
+        let mut guard = self.child.lock().expect("sidecar child mutex poisoned");
+        let managed = guard.as_mut()?;
+        match managed.child.try_wait() {
+            Ok(None) => Some(managed.child.id()),
+            _ => {
+                *guard = None;
+                None
+            }
+        }
+    }
+
     fn kill(&self) -> Result<(), SidecarError> {
         let mut guard = self.child.lock().expect("sidecar child mutex poisoned");
-        let Some(mut child) = guard.take() else {
+        let Some(mut managed) = guard.take() else {
             return Ok(());
         };
-        terminate_child(&mut child)
+        terminate_child(&mut managed.child)
     }
+
+    fn kill_pid(&self, pid: u32) -> Result<(), RuntimeError> {
+        if pid == 0 {
+            return Ok(());
+        }
+        if self.pid() == Some(pid) {
+            return self.kill().map_err(RuntimeError::from);
+        }
+        #[cfg(windows)]
+        {
+            kill_orphaned_singbox_pid(pid)
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(())
+        }
+    }
+}
+
+fn is_singbox_image_path(path: &str) -> bool {
+    let Some(filename) = path.trim().rsplit(['\\', '/']).next() else {
+        return false;
+    };
+    let lower = filename.to_ascii_lowercase();
+    lower.starts_with("sing-box") && lower.ends_with(".exe")
+}
+
+#[cfg(windows)]
+fn win32_err_to_io(err: &windows::core::Error) -> std::io::Error {
+    let code = (err.code().0 as u32) & 0xFFFF;
+    if code != 0 {
+        std::io::Error::from_raw_os_error(code as i32)
+    } else {
+        std::io::Error::other(err.message())
+    }
+}
+
+#[cfg(windows)]
+fn attach_kill_on_close_job(child: &Child) -> Result<JobHandle, SidecarError> {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    let raw_job = unsafe { CreateJobObjectW(None, PCWSTR::null()) }
+        .map_err(|e| SidecarError::ProcessControlFailed(win32_err_to_io(&e)))?;
+    let job = JobHandle(raw_job);
+
+    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+    unsafe {
+        SetInformationJobObject(
+            job.0,
+            JobObjectExtendedLimitInformation,
+            (&raw const info).cast::<c_void>(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    }
+    .map_err(|e| SidecarError::ProcessControlFailed(win32_err_to_io(&e)))?;
+
+    let child_handle = HANDLE(child.as_raw_handle());
+    unsafe { AssignProcessToJobObject(job.0, child_handle) }
+        .map_err(|e| SidecarError::ProcessControlFailed(win32_err_to_io(&e)))?;
+
+    Ok(job)
+}
+
+#[cfg(windows)]
+fn kill_orphaned_singbox_pid(pid: u32) -> Result<(), RuntimeError> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, ERROR_NOT_FOUND, HANDLE,
+        STILL_ACTIVE,
+    };
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
+        WaitForSingleObject, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_TERMINATE,
+    };
+
+    struct ProcessHandleGuard(HANDLE);
+    impl Drop for ProcessHandleGuard {
+        fn drop(&mut self) {
+            if !self.0.is_invalid() {
+                unsafe {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    fn query_image_path(handle: HANDLE) -> Option<String> {
+        let mut buf = vec![0u16; 1024];
+        let mut len = buf.len() as u32;
+        let res = unsafe {
+            QueryFullProcessImageNameW(
+                handle,
+                PROCESS_NAME_WIN32,
+                PWSTR(buf.as_mut_ptr()),
+                &mut len,
+            )
+        };
+        if res.is_ok() && (len as usize) <= buf.len() {
+            Some(String::from_utf16_lossy(&buf[..len as usize]))
+        } else {
+            None
+        }
+    }
+
+    let handle = match unsafe {
+        OpenProcess(
+            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+            false,
+            pid,
+        )
+    } {
+        Ok(h) => ProcessHandleGuard(h),
+        Err(err) => {
+            let code = (err.code().0 as u32) & 0xFFFF;
+            if code == ERROR_INVALID_PARAMETER.0 || code == ERROR_NOT_FOUND.0 {
+                return Ok(());
+            }
+            if code == ERROR_ACCESS_DENIED.0 {
+                if let Ok(q_handle) =
+                    unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
+                {
+                    let q_guard = ProcessHandleGuard(q_handle);
+                    if let Some(path) = query_image_path(q_guard.0) {
+                        if !is_singbox_image_path(&path) {
+                            // PID was recycled by another application; never terminate it.
+                            return Ok(());
+                        }
+                    }
+                    return Err(RuntimeError::Sidecar(SidecarError::ProcessControlFailed(
+                        win32_err_to_io(&err),
+                    )));
+                }
+                // Protected system process (PPL) cannot be sing-box.exe.
+                return Ok(());
+            }
+            return Err(RuntimeError::Sidecar(SidecarError::ProcessControlFailed(
+                win32_err_to_io(&err),
+            )));
+        }
+    };
+
+    let Some(image_path) = query_image_path(handle.0) else {
+        return Ok(());
+    };
+    if !is_singbox_image_path(&image_path) {
+        return Ok(());
+    }
+
+    let mut exit_code: u32 = 0;
+    if unsafe { GetExitCodeProcess(handle.0, &mut exit_code) }.is_ok()
+        && exit_code != STILL_ACTIVE.0 as u32
+    {
+        return Ok(());
+    }
+
+    if let Err(err) = unsafe { TerminateProcess(handle.0, 1) } {
+        let mut after_code: u32 = 0;
+        if unsafe { GetExitCodeProcess(handle.0, &mut after_code) }.is_ok()
+            && after_code != STILL_ACTIVE.0 as u32
+        {
+            return Ok(());
+        }
+        return Err(RuntimeError::Sidecar(SidecarError::ProcessControlFailed(
+            win32_err_to_io(&err),
+        )));
+    }
+
+    unsafe {
+        let _ = WaitForSingleObject(handle.0, 3_000);
+    }
+    Ok(())
 }
 
 fn terminate_child(child: &mut Child) -> Result<(), SidecarError> {
@@ -225,8 +464,8 @@ fn terminate_child(child: &mut Child) -> Result<(), SidecarError> {
 impl Drop for SingBoxSidecar {
     fn drop(&mut self) {
         if let Ok(mut guard) = self.child.lock() {
-            if let Some(mut child) = guard.take() {
-                let _ = terminate_child(&mut child);
+            if let Some(mut managed) = guard.take() {
+                let _ = terminate_child(&mut managed.child);
             }
         }
     }
@@ -339,6 +578,7 @@ struct InnerState {
 struct PreparedApply {
     validated: ValidatedGraph,
     default_physical_interface: String,
+    clash_api_port: u16,
     discovery_snap: DiscoverySnapshot,
     vpn_runtime: HashMap<VpnProvider, ResolvedVpnRuntimeInfo>,
     pre_netflow_warp_mode: Option<String>,
@@ -409,6 +649,9 @@ impl EngineRuntime {
         };
 
         let _ = self.sidecar.kill();
+        if let Some(pid) = snapshot.singbox_pid {
+            self.sidecar.kill_pid(pid)?;
+        }
         restore_snapshot_state(&*self.net_ops, &snapshot)?;
         self.recovery_store.clear()?;
 
@@ -475,7 +718,7 @@ impl EngineRuntime {
         }
         self.emit_status();
 
-        let snapshot = if let Some(old_session) = existing_session {
+        let mut snapshot = if let Some(old_session) = existing_session {
             let sidecar = Arc::clone(&self.sidecar);
             if let Err(err) = run_blocking(move || sidecar.kill().map_err(RuntimeError::from)).await
             {
@@ -484,6 +727,7 @@ impl EngineRuntime {
                     .await);
             }
             let mut snap = old_session.recovery;
+            snap.singbox_pid = None;
             if let Err(err) = self
                 .reconcile_hot_switch(
                     &mut prepared,
@@ -514,6 +758,8 @@ impl EngineRuntime {
                 system_proxy: Some(system_proxy),
                 vpn_entries: HashMap::new(),
                 pinned_host_routes: Vec::new(),
+                removed_bypass_routes: Vec::new(),
+                singbox_pid: None,
             };
             let store = self.recovery_store.clone();
             let snap_for_save = snap.clone();
@@ -567,11 +813,7 @@ impl EngineRuntime {
             }
         }
 
-        if let Err(err) = self.ensure_tun_route_priority().await {
-            return Err(self.rollback_on_apply_failure(&snapshot, err).await);
-        }
-
-        // Persist finalized snapshot (noop if already flushed, ensures consistency).
+        snapshot.singbox_pid = self.sidecar.pid();
         {
             let store = self.recovery_store.clone();
             let snap_for_save = snapshot.clone();
@@ -584,6 +826,10 @@ impl EngineRuntime {
             {
                 return Err(self.rollback_on_apply_failure(&snapshot, err).await);
             }
+        }
+
+        if let Err(err) = self.ensure_tun_route_priority().await {
+            return Err(self.rollback_on_apply_failure(&snapshot, err).await);
         }
 
         let node_health = initial_node_health(&prepared.validated);
@@ -614,7 +860,7 @@ impl EngineRuntime {
         };
 
         let traffic_monitor = TrafficMonitor::spawn(
-            self.config.clash_api_port,
+            prepared.clash_api_port,
             prepared.outbound_to_node_id,
             self.event_tx.clone(),
         );
@@ -835,7 +1081,7 @@ impl EngineRuntime {
                     validated: prepared.validated.clone(),
                     default_physical_interface: prepared.default_physical_interface.clone(),
                     vpn_runtime: prepared.vpn_runtime.clone(),
-                    clash_api_port: self.config.clash_api_port,
+                    clash_api_port: prepared.clash_api_port,
                     log_path: self.config.runtime_dir.join("sing-box.log"),
                 })?;
                 prepared.outbound_to_node_id = compiled.outbound_to_node_id;
@@ -862,10 +1108,7 @@ impl EngineRuntime {
         &self,
         target_mode: WarpMode,
     ) -> Result<DiscoverySnapshot, RuntimeError> {
-        let attempts = match target_mode {
-            WarpMode::Tun => self.config.tun_ready_attempts.max(1),
-            WarpMode::Proxy => 1,
-        };
+        let attempts = self.config.tun_ready_attempts.max(1);
 
         for attempt in 0..attempts {
             let discovery = Arc::clone(&self.discovery);
@@ -875,30 +1118,53 @@ impl EngineRuntime {
                 .iter()
                 .find(|v| v.provider == VpnProvider::CloudflareWarp);
 
-            match detected {
-                Some(v) if !v.is_running => {
-                    return Err(RuntimeError::VpnAdapter(VpnAdapterError::NotRunning(
-                        VpnProvider::CloudflareWarp,
-                    )));
-                }
-                Some(v)
-                    if target_mode == WarpMode::Proxy
-                        || v.adapter_if_index.is_some()
-                        || v.adapter_alias
-                            .as_deref()
-                            .is_some_and(|a| !a.trim().is_empty()) =>
-                {
-                    return Ok(snap);
-                }
-                _ if attempt + 1 < attempts && !self.config.tun_ready_retry_delay.is_zero() => {
-                    tokio::time::sleep(self.config.tun_ready_retry_delay).await;
-                }
-                _ => return Ok(snap),
+            let ready = match detected {
+                Some(v) => match target_mode {
+                    WarpMode::Tun => {
+                        v.is_running
+                            && v.adapter_is_up
+                            && (v.adapter_if_index.is_some()
+                                || v.adapter_alias
+                                    .as_deref()
+                                    .is_some_and(|a| !a.trim().is_empty()))
+                    }
+                    WarpMode::Proxy => {
+                        v.is_running
+                            && (v.detected_port.is_some()
+                                || v.warp_current_mode
+                                    .as_deref()
+                                    .is_some_and(|m| m.eq_ignore_ascii_case("proxy")))
+                    }
+                },
+                None => false,
+            };
+
+            if ready {
+                return Ok(snap);
+            }
+
+            if attempt + 1 < attempts && !self.config.tun_ready_retry_delay.is_zero() {
+                tokio::time::sleep(self.config.tun_ready_retry_delay).await;
             }
         }
 
         let discovery = Arc::clone(&self.discovery);
-        run_blocking(move || discovery.snapshot().map_err(RuntimeError::from)).await
+        let snap = run_blocking(move || discovery.snapshot().map_err(RuntimeError::from)).await?;
+        let detected = snap
+            .vpns
+            .iter()
+            .find(|v| v.provider == VpnProvider::CloudflareWarp);
+        match detected {
+            Some(v) if !v.is_running || (target_mode == WarpMode::Tun && !v.adapter_is_up) => {
+                Err(RuntimeError::VpnAdapter(VpnAdapterError::NotRunning(
+                    VpnProvider::CloudflareWarp,
+                )))
+            }
+            None => Err(RuntimeError::VpnAdapter(VpnAdapterError::NotRunning(
+                VpnProvider::CloudflareWarp,
+            ))),
+            Some(_) => Ok(snap),
+        }
     }
 
     async fn ensure_tun_route_priority(&self) -> Result<(), RuntimeError> {
@@ -1298,11 +1564,12 @@ fn prepare_apply_blocking(
         vpn_runtime.insert(chain.provider, resolved);
     }
 
+    let clash_api_port = resolve_clash_api_port(config.clash_api_port);
     let compiled = compile_singbox_config(&CompileInput {
         validated: validated.clone(),
         default_physical_interface: default_physical_interface.clone(),
         vpn_runtime: vpn_runtime.clone(),
-        clash_api_port: config.clash_api_port,
+        clash_api_port,
         log_path: config.runtime_dir.join("sing-box.log"),
     })?;
     let compiled_config_bytes = serde_json::to_vec_pretty(&compiled.json)?;
@@ -1310,12 +1577,30 @@ fn prepare_apply_blocking(
     Ok(PreparedApply {
         validated,
         default_physical_interface,
+        clash_api_port,
         discovery_snap,
         vpn_runtime,
         pre_netflow_warp_mode,
         outbound_to_node_id: compiled.outbound_to_node_id,
         compiled_config_bytes,
     })
+}
+
+fn resolve_clash_api_port(configured_port: u16) -> u16 {
+    if configured_port != 0 {
+        return configured_port;
+    }
+    for _ in 0..3 {
+        if let Ok(listener) = TcpListener::bind("127.0.0.1:0") {
+            if let Ok(addr) = listener.local_addr() {
+                let port = addr.port();
+                if port != 0 && port != 9090 {
+                    return port;
+                }
+            }
+        }
+    }
+    FALLBACK_CLASH_API_PORT
 }
 
 fn apply_cold_start_mutations_blocking(
@@ -1355,6 +1640,14 @@ fn reconcile_hot_switch_removals_blocking(
         while let Some(route) = snapshot.pinned_host_routes.last().cloned() {
             remove_route_ignore_missing(net_ops, &route)?;
             snapshot.pinned_host_routes.pop();
+        }
+        recovery_store.save_atomic(snapshot)?;
+    }
+
+    if !snapshot.removed_bypass_routes.is_empty() {
+        while let Some(route) = snapshot.removed_bypass_routes.last().cloned() {
+            add_route_ignore_benign(net_ops, &route)?;
+            snapshot.removed_bypass_routes.pop();
         }
         recovery_store.save_atomic(snapshot)?;
     }
@@ -1474,6 +1767,16 @@ fn apply_remaining_hot_switch_vpns_blocking(
     Ok(())
 }
 
+fn canonical_ipv4_prefix(route: &RouteRecord) -> Option<String> {
+    if route.is_ipv6 {
+        return None;
+    }
+    let (ip_str, len_str) = route.destination_prefix.trim().split_once('/')?;
+    let ip: Ipv4Addr = ip_str.parse().ok()?;
+    let len: u8 = len_str.parse().ok()?;
+    Some(format!("{ip}/{len}"))
+}
+
 fn maybe_pin_openvpn_route_blocking(
     net_ops: &dyn WindowsNetworkOps,
     recovery_store: &RecoveryStore,
@@ -1491,19 +1794,55 @@ fn maybe_pin_openvpn_route_blocking(
     let Some(upstream_node) = prepared.validated.nodes_by_id.get(&chain.upstream_node_id) else {
         return Ok(());
     };
-    let NodeKind::Interface {
-        interface_alias, ..
-    } = &upstream_node.kind
-    else {
-        // Chained downstream of another VPN: compiler emits <server_ip>/32 sing-box rule instead.
-        return Ok(());
-    };
-    let upstream_if = find_physical_interface(&prepared.discovery_snap.interfaces, interface_alias)
-        .ok_or_else(|| RuntimeError::InterfaceDown(interface_alias.clone()))?;
+    match &upstream_node.kind {
+        NodeKind::Interface {
+            interface_alias, ..
+        } => {
+            let upstream_if =
+                find_physical_interface(&prepared.discovery_snap.interfaces, interface_alias)
+                    .ok_or_else(|| RuntimeError::InterfaceDown(interface_alias.clone()))?;
 
-    let pinned_route = pin_openvpn_dco_host_route(net_ops, server_ip, upstream_if)?;
-    snapshot.pinned_host_routes.push(pinned_route);
-    recovery_store.save_atomic(snapshot)?;
+            if let Some(pinned_route) =
+                pin_openvpn_dco_host_route(net_ops, server_ip, upstream_if)?
+            {
+                snapshot.pinned_host_routes.push(pinned_route);
+                recovery_store.save_atomic(snapshot)?;
+            }
+        }
+        NodeKind::Vpn { .. } => {
+            // Chained downstream of another VPN: remove any physical /32 route to the OpenVPN
+            // server so packets hit NetFlow-TUN and match compiler.rs's ip_cidr -> upstream VPN rule.
+            let Ok(parsed_ip) = server_ip.trim().parse::<Ipv4Addr>() else {
+                return Ok(());
+            };
+            let target_prefix = format!("{parsed_ip}/32");
+            let mut changed = false;
+            for phys in &prepared.discovery_snap.interfaces {
+                let routes = net_ops.list_routes(Some(phys.if_index), false)?;
+                for route in routes {
+                    if canonical_ipv4_prefix(&route).as_deref() == Some(target_prefix.as_str()) {
+                        match net_ops.remove_route(&route) {
+                            Ok(()) => {
+                                snapshot.removed_bypass_routes.push(route);
+                                changed = true;
+                            }
+                            Err(err)
+                                if is_benign_remove_route_error(
+                                    net_ops,
+                                    route.interface_index,
+                                    &err,
+                                ) => {}
+                            Err(err) => return Err(err.into()),
+                        }
+                    }
+                }
+            }
+            if changed {
+                recovery_store.save_atomic(snapshot)?;
+            }
+        }
+        NodeKind::Apps { .. } => {}
+    }
     Ok(())
 }
 
@@ -1568,12 +1907,12 @@ fn evaluate_node_health(
     }
 
     for chain in &validated.vpn_chains {
-        let running = snapshot
+        let healthy = snapshot
             .vpns
             .iter()
             .find(|v| v.provider == chain.provider)
-            .is_some_and(|v| v.is_running);
-        if running {
+            .is_some_and(|v| is_vpn_node_healthy(chain, v));
+        if healthy {
             health.insert(chain.node_id.clone(), NodeHealth::Healthy);
         } else {
             health.insert(chain.node_id.clone(), NodeHealth::Dropped);
@@ -1582,6 +1921,23 @@ fn evaluate_node_health(
     }
 
     (health, dropped)
+}
+
+fn is_vpn_node_healthy(chain: &ValidatedVpnChain, info: &DetectedVpnInfo) -> bool {
+    if !info.is_running {
+        return false;
+    }
+    match chain.provider {
+        VpnProvider::Karing => {
+            info.detected_port.is_some()
+                || chain.settings.karing_port_override.is_some_and(|p| p != 0)
+        }
+        VpnProvider::CloudflareWarp => match chain.settings.warp_mode {
+            WarpMode::Tun => info.adapter_is_up,
+            WarpMode::Proxy => info.detected_port.is_some(),
+        },
+        VpnProvider::OpenVpn => info.adapter_is_up,
+    }
 }
 
 fn provider_display_name(provider: VpnProvider) -> &'static str {
@@ -1598,8 +1954,18 @@ fn remove_route_ignore_missing(
 ) -> Result<(), NetOpsError> {
     match ops.remove_route(route) {
         Ok(()) => Ok(()),
-        Err(NetOpsError::RouteNotFound { .. }) => Ok(()),
-        Err(NetOpsError::Win32 { code, .. }) if code == ERROR_NOT_FOUND_CODE => Ok(()),
+        Err(err) if is_benign_remove_route_error(ops, route.interface_index, &err) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn add_route_ignore_benign(
+    ops: &dyn WindowsNetworkOps,
+    route: &RouteRecord,
+) -> Result<(), NetOpsError> {
+    match ops.add_route(route) {
+        Ok(()) => Ok(()),
+        Err(err) if is_benign_restore_add_route_error(ops, route.interface_index, &err) => Ok(()),
         Err(err) => Err(err),
     }
 }
@@ -1628,6 +1994,15 @@ fn restore_snapshot_state(
         if let Err(err) = remove_route_ignore_missing(ops, route) {
             errors.push(format!(
                 "remove pinned host route {}: {err}",
+                route.destination_prefix
+            ));
+        }
+    }
+
+    for route in &snapshot.removed_bypass_routes {
+        if let Err(err) = add_route_ignore_benign(ops, route) {
+            errors.push(format!(
+                "restore removed bypass route {}: {err}",
                 route.destination_prefix
             ));
         }
@@ -1760,6 +2135,13 @@ mod tests {
             }
         }
 
+        fn set_vpn_adapter_up(&self, provider: VpnProvider, adapter_is_up: bool) {
+            let mut guard = self.snapshot.lock().unwrap();
+            if let Some(vpn) = guard.vpns.iter_mut().find(|v| v.provider == provider) {
+                vpn.adapter_is_up = adapter_is_up;
+            }
+        }
+
         fn set_interface_up(&self, alias: &str, is_up: bool) {
             let mut guard = self.snapshot.lock().unwrap();
             if let Some(iface) = guard
@@ -1790,6 +2172,9 @@ mod tests {
         recovery_path_to_probe: Option<PathBuf>,
         recovery_existed_before_first_mutation: Option<bool>,
         warp_sync_discovery: Option<Arc<MockDiscovery>>,
+        vanished_interfaces: HashSet<u32>,
+        vanished_error_code: Option<u32>,
+        fail_remove_prefix: Option<String>,
     }
 
     struct MockNetworkOps {
@@ -1869,6 +2254,19 @@ mod tests {
         fn attach_warp_discovery_sync(&self, discovery: Arc<MockDiscovery>) {
             self.state.lock().unwrap().warp_sync_discovery = Some(discovery);
         }
+
+        fn mark_interface_vanished(&self, if_index: u32, error_code: u32) {
+            let mut state = self.state.lock().unwrap();
+            state.vanished_interfaces.insert(if_index);
+            state.vanished_error_code = Some(error_code);
+            state.routes.remove(&if_index);
+            state.metrics.remove(&(if_index, false));
+            state.metrics.remove(&(if_index, true));
+        }
+
+        fn set_fail_remove_prefix(&self, prefix: Option<&str>) {
+            self.state.lock().unwrap().fail_remove_prefix = prefix.map(ToString::to_string);
+        }
     }
 
     fn record_mutation_probe(state: &mut MockNetState, op: String) {
@@ -1915,6 +2313,14 @@ mod tests {
                     route.route_metric
                 ),
             );
+            if state.vanished_interfaces.contains(&route.interface_index) {
+                let code = state.vanished_error_code.unwrap_or(1168);
+                return Err(NetOpsError::Win32 {
+                    operation: "CreateIpForwardEntry2",
+                    code,
+                    message: "Vanished interface.".to_string(),
+                });
+            }
             state
                 .routes
                 .entry(route.interface_index)
@@ -1932,6 +2338,21 @@ mod tests {
                     route.interface_index, route.destination_prefix, route.next_hop
                 ),
             );
+            if state.fail_remove_prefix.as_deref() == Some(route.destination_prefix.as_str()) {
+                return Err(NetOpsError::Win32 {
+                    operation: "DeleteIpForwardEntry2",
+                    code: 5,
+                    message: "Access is denied.".to_string(),
+                });
+            }
+            if state.vanished_interfaces.contains(&route.interface_index) {
+                let code = state.vanished_error_code.unwrap_or(1168);
+                return Err(NetOpsError::Win32 {
+                    operation: "DeleteIpForwardEntry2",
+                    code,
+                    message: "Vanished interface.".to_string(),
+                });
+            }
             let list = state.routes.entry(route.interface_index).or_default();
             if let Some(pos) = list.iter().position(|r| {
                 r.destination_prefix == route.destination_prefix
@@ -1961,7 +2382,7 @@ mod tests {
                 .cloned()
                 .ok_or(NetOpsError::Win32 {
                     operation: "GetIpInterfaceEntry",
-                    code: ERROR_NOT_FOUND_CODE,
+                    code: 1168,
                     message: "not found".to_string(),
                 })
         }
@@ -1980,6 +2401,14 @@ mod tests {
                     "set_interface_metric:{interface_index}:{is_ipv6}:{metric}:{automatic_metric}"
                 ),
             );
+            if state.vanished_interfaces.contains(&interface_index) {
+                let code = state.vanished_error_code.unwrap_or(1168);
+                return Err(NetOpsError::Win32 {
+                    operation: "SetIpInterfaceEntry",
+                    code,
+                    message: "Vanished interface.".to_string(),
+                });
+            }
             state.metrics.insert(
                 (interface_index, is_ipv6),
                 InterfaceMetricSnapshot {
@@ -1990,6 +2419,11 @@ mod tests {
                 },
             );
             Ok(())
+        }
+
+        fn interface_exists(&self, interface_index: u32) -> Result<bool, NetOpsError> {
+            let state = self.state.lock().unwrap();
+            Ok(!state.vanished_interfaces.contains(&interface_index))
         }
 
         fn find_best_route_interface(&self, dest_ipv4: &str) -> Result<Option<String>, NetOpsError> {
@@ -2079,11 +2513,13 @@ mod tests {
                         warp.detected_port = Some(40000);
                         warp.adapter_alias = None;
                         warp.adapter_if_index = None;
+                        warp.adapter_is_up = false;
                         warp.adapter_gateway = None;
                     } else {
                         warp.detected_port = None;
                         warp.adapter_alias = Some("CloudflareWARP".to_string());
                         warp.adapter_if_index = Some(40);
+                        warp.adapter_is_up = true;
                         warp.adapter_gateway = Some("172.16.0.1".to_string());
                     }
                 }
@@ -2097,6 +2533,8 @@ mod tests {
         spawn_calls: Vec<PathBuf>,
         last_spawned_json: Option<Value>,
         kill_count: usize,
+        kill_pid_calls: Vec<u32>,
+        pid: Option<u32>,
         alive: bool,
         fail_spawn: bool,
     }
@@ -2120,6 +2558,10 @@ mod tests {
 
         fn set_alive(&self, alive: bool) {
             self.state.lock().unwrap().alive = alive;
+        }
+
+        fn kill_pid_calls(&self) -> Vec<u32> {
+            self.state.lock().unwrap().kill_pid_calls.clone()
         }
 
         fn stats(&self) -> (Vec<PathBuf>, usize, bool, Option<Value>) {
@@ -2151,11 +2593,21 @@ mod tests {
             state.last_spawned_json = Some(json);
             state.spawn_calls.push(config_path.to_path_buf());
             state.alive = true;
+            state.pid = Some(9000 + state.spawn_calls.len() as u32);
             Ok(())
         }
 
         fn is_alive(&self) -> bool {
             self.state.lock().unwrap().alive
+        }
+
+        fn pid(&self) -> Option<u32> {
+            let state = self.state.lock().unwrap();
+            if state.alive {
+                state.pid
+            } else {
+                None
+            }
         }
 
         fn kill(&self) -> Result<(), SidecarError> {
@@ -2165,6 +2617,24 @@ mod tests {
             let mut state = self.state.lock().unwrap();
             state.kill_count += 1;
             state.alive = false;
+            state.pid = None;
+            Ok(())
+        }
+
+        fn kill_pid(&self, pid: u32) -> Result<(), RuntimeError> {
+            if let Some(ref ops) = self.ops_log_sink {
+                ops.state
+                    .lock()
+                    .unwrap()
+                    .ops_log
+                    .push(format!("sidecar.kill_pid:{pid}"));
+            }
+            let mut state = self.state.lock().unwrap();
+            state.kill_pid_calls.push(pid);
+            if state.pid == Some(pid) {
+                state.alive = false;
+                state.pid = None;
+            }
             Ok(())
         }
     }
@@ -2200,6 +2670,7 @@ mod tests {
                     detected_port: Some(3067),
                     adapter_alias: Some("karing-tun".to_string()),
                     adapter_if_index: Some(20),
+                    adapter_is_up: true,
                     adapter_gateway: Some("172.16.0.2".to_string()),
                     remote_server_ip: None,
                     warp_current_mode: None,
@@ -2210,6 +2681,7 @@ mod tests {
                     detected_port: None,
                     adapter_alias: Some("OpenVPN Data Channel Offload".to_string()),
                     adapter_if_index: Some(30),
+                    adapter_is_up: true,
                     adapter_gateway: None,
                     remote_server_ip: Some("203.0.113.10".to_string()),
                     warp_current_mode: None,
@@ -2220,6 +2692,7 @@ mod tests {
                     detected_port: None,
                     adapter_alias: Some("CloudflareWARP".to_string()),
                     adapter_if_index: Some(40),
+                    adapter_is_up: true,
                     adapter_gateway: Some("172.16.0.1".to_string()),
                     remote_server_ip: None,
                     warp_current_mode: Some("warp".to_string()),
@@ -2469,6 +2942,8 @@ mod tests {
                 system_proxy: Some(original_proxy.clone()),
                 vpn_entries,
                 pinned_host_routes: vec![pinned.clone()],
+                removed_bypass_routes: Vec::new(),
+                singbox_pid: None,
             })
             .expect("seed stale recovery.json");
 
@@ -2969,6 +3444,7 @@ mod tests {
             warp.detected_port = Some(40000);
             warp.adapter_alias = None;
             warp.adapter_if_index = None;
+            warp.adapter_is_up = false;
             warp.adapter_gateway = None;
             warp.warp_current_mode = Some("proxy".to_string());
         }
@@ -3176,5 +3652,459 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir_a);
         let _ = fs::remove_dir_all(&dir_b);
+    }
+
+    #[tokio::test]
+    async fn test_recover_if_stale_kills_saved_singbox_pid_before_restoring_routes() {
+        // Part A: apply() records singbox_pid in recovery.json.
+        let dir = temp_test_dir("recover-pid");
+        let recovery_path = dir.join("recovery.json");
+        let discovery = Arc::new(MockDiscovery::new(base_discovery_snapshot()));
+        let ops = Arc::new(MockNetworkOps::new(SystemProxySnapshot {
+            proxy_enable: 1,
+            proxy_server: Some("127.0.0.1:3067".to_string()),
+            proxy_override: None,
+        }));
+        seed_vpn_routes(&ops);
+        let sidecar = Arc::new(MockSidecarRunner::new(Some(Arc::clone(&ops))));
+        let runtime = make_runtime(&dir, discovery, Arc::clone(&ops), Arc::clone(&sidecar));
+
+        runtime
+            .apply(Some("wf-pid".to_string()), &karing_workflow())
+            .await
+            .expect("apply succeeds");
+        let store = RecoveryStore::new(recovery_path.clone());
+        let saved = store.load().unwrap().expect("recovery snapshot exists");
+        assert_eq!(saved.singbox_pid, Some(9001));
+        runtime.stop().await.expect("stop");
+
+        // Part B: Simulate orphaned sing-box.exe PID left in recovery.json on crash restart.
+        let mut crashed = saved.clone();
+        crashed.singbox_pid = Some(43210);
+        store.save_atomic(&crashed).expect("seed crashed snapshot");
+        ops.clear_ops_log();
+
+        let discovery2 = Arc::new(MockDiscovery::new(base_discovery_snapshot()));
+        let sidecar2 = Arc::new(MockSidecarRunner::new(Some(Arc::clone(&ops))));
+        let runtime2 = make_runtime(&dir, discovery2, Arc::clone(&ops), Arc::clone(&sidecar2));
+
+        assert!(runtime2.recover_if_stale().expect("recover succeeds"));
+        assert!(!recovery_path.exists());
+        assert_eq!(sidecar2.kill_pid_calls(), vec![43210]);
+
+        let ops_log = ops.snapshot_state().0;
+        let pos_kill_pid = ops_log
+            .iter()
+            .position(|e| e == "sidecar.kill_pid:43210")
+            .expect("kill_pid called");
+        let pos_restore_route = ops_log
+            .iter()
+            .position(|e| e.starts_with("remove_route:") || e.starts_with("add_route:") || e == "set_system_proxy")
+            .expect("route/proxy restoration occurred");
+        assert!(
+            pos_kill_pid < pos_restore_route,
+            "kill_pid must run BEFORE restoring routes/proxy: {ops_log:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_singbox_image_name_filter_and_kill_pid_safety() {
+        assert!(is_singbox_image_path(r"C:\Program Files\NetFlow\sing-box.exe"));
+        assert!(is_singbox_image_path(
+            r"D:\Study\src-tauri\binaries\sing-box-x86_64-pc-windows-msvc.exe"
+        ));
+        assert!(!is_singbox_image_path(r"C:\Windows\System32\notepad.exe"));
+        assert!(!is_singbox_image_path(r"C:\Program Files\Google\chrome.exe"));
+        assert!(!is_singbox_image_path(""));
+
+        let dir = temp_test_dir("kill-pid-safety");
+        let sidecar = SingBoxSidecar::new(dir.join("sing-box.exe"), dir.clone());
+        // PID 0 and current test runner PID (not sing-box*.exe) must be safely ignored.
+        sidecar.kill_pid(0).expect("pid 0 ignored");
+        sidecar
+            .kill_pid(std::process::id())
+            .expect("non-sing-box pid must never be terminated");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_apply_and_stop_preserve_preexisting_openvpn_dco_host_route() {
+        let dir = temp_test_dir("ovpn-preexisting-dco");
+        let discovery = Arc::new(MockDiscovery::new(base_discovery_snapshot()));
+        let ops = Arc::new(MockNetworkOps::new(SystemProxySnapshot {
+            proxy_enable: 0,
+            proxy_server: None,
+            proxy_override: None,
+        }));
+        seed_vpn_routes(&ops);
+        let preexisting_dco = route(12, "203.0.113.10/32", "192.168.1.1", 5, false);
+        ops.seed_interface(12, 25, true, vec![preexisting_dco.clone()]);
+
+        let sidecar = Arc::new(MockSidecarRunner::new(Some(Arc::clone(&ops))));
+        let runtime = make_runtime(&dir, discovery, Arc::clone(&ops), sidecar);
+
+        let ovpn_graph = WorkflowGraph {
+            nodes: vec![
+                iface_node("if-wifi", "Wi-Fi", false),
+                vpn_node("vpn-ovpn", VpnProvider::OpenVpn, false, VpnNodeSettings::default()),
+                apps_node("apps-1", &["chrome.exe"]),
+            ],
+            edges: vec![
+                edge("e1", "if-wifi", "vpn-ovpn"),
+                edge("e2", "vpn-ovpn", "apps-1"),
+            ],
+        };
+
+        runtime
+            .apply(Some("wf-ovpn".to_string()), &ovpn_graph)
+            .await
+            .expect("apply succeeds when /32 route already exists");
+
+        let store = RecoveryStore::new(dir.join("recovery.json"));
+        let saved = store.load().unwrap().expect("recovery snapshot exists");
+        assert!(
+            saved.pinned_host_routes.is_empty(),
+            "pre-existing /32 route must NOT be recorded in pinned_host_routes"
+        );
+        let ops_log = ops.snapshot_state().0;
+        assert!(
+            !ops_log.iter().any(|e| e.starts_with("add_route:12:203.0.113.10/32")),
+            "add_route must NOT be called for pre-existing /32 route: {ops_log:?}"
+        );
+
+        runtime.stop().await.expect("clean stop");
+        let routes_after = ops.snapshot_state().2;
+        assert!(
+            routes_after
+                .get(&12)
+                .unwrap()
+                .contains(&preexisting_dco),
+            "stop() must NOT remove OpenVPN's pre-existing /32 host route"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_recover_if_stale_after_reboot_tolerates_vanished_tun_adapter_and_clears_recovery() {
+        let dir = temp_test_dir("recover-vanished-tun");
+        let recovery_path = dir.join("recovery.json");
+        let store = RecoveryStore::new(recovery_path.clone());
+
+        let original_proxy = SystemProxySnapshot {
+            proxy_enable: 1,
+            proxy_server: Some("127.0.0.1:3067".to_string()),
+            proxy_override: Some("localhost".to_string()),
+        };
+        let vanished_if = 30;
+        let mut vpn_entries = HashMap::new();
+        vpn_entries.insert(
+            VpnProvider::OpenVpn,
+            VpnRecoveryEntry {
+                provider: VpnProvider::OpenVpn,
+                removed_routes: vec![route(vanished_if, "0.0.0.0/1", "10.8.0.1", 0, false)],
+                added_routes: vec![route(vanished_if, "0.0.0.0/0", "10.8.0.1", 500, false)],
+                metric_snapshots: vec![InterfaceMetricSnapshot {
+                    interface_index: vanished_if,
+                    is_ipv6: false,
+                    original_metric: 10,
+                    automatic_metric: false,
+                }],
+                warp_previous_mode: None,
+            },
+        );
+        // Pinned host route also missing after reboot
+        let vanished_pinned = route(12, "203.0.113.10/32", "192.168.1.1", 0, false);
+        store
+            .save_atomic(&RecoverySnapshot {
+                created_at: "2026-11-24T00:00:00Z".to_string(),
+                system_proxy: Some(original_proxy.clone()),
+                vpn_entries,
+                pinned_host_routes: vec![vanished_pinned],
+                removed_bypass_routes: Vec::new(),
+                singbox_pid: Some(999999),
+            })
+            .expect("seed recovery snapshot");
+
+        let discovery = Arc::new(MockDiscovery::new(base_discovery_snapshot()));
+        let ops = Arc::new(MockNetworkOps::new(SystemProxySnapshot {
+            proxy_enable: 0,
+            proxy_server: Some("127.0.0.1:3067".to_string()),
+            proxy_override: Some("localhost".to_string()),
+        }));
+        ops.mark_interface_vanished(vanished_if, 1168);
+        let sidecar = Arc::new(MockSidecarRunner::new(None));
+        let runtime = make_runtime(&dir, discovery, Arc::clone(&ops), sidecar);
+
+        assert!(runtime.recover_if_stale().expect("recover succeeds despite vanished TUN"));
+        assert!(!recovery_path.exists(), "recovery.json must be deleted");
+        assert_eq!(ops.snapshot_state().1, original_proxy);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_stop_after_vpn_closed_tolerates_vanished_tun_clears_recovery_and_transitions_to_stopped() {
+        let dir = temp_test_dir("stop-vanished-tun");
+        let discovery = Arc::new(MockDiscovery::new(base_discovery_snapshot()));
+        let initial_proxy = SystemProxySnapshot {
+            proxy_enable: 1,
+            proxy_server: Some("127.0.0.1:3067".to_string()),
+            proxy_override: None,
+        };
+        let ops = Arc::new(MockNetworkOps::new(initial_proxy.clone()));
+        seed_vpn_routes(&ops);
+        ops.seed_interface(12, 25, true, vec![]);
+        let sidecar = Arc::new(MockSidecarRunner::new(Some(Arc::clone(&ops))));
+        let runtime = make_runtime(&dir, discovery, Arc::clone(&ops), sidecar);
+
+        let ovpn_graph = WorkflowGraph {
+            nodes: vec![
+                iface_node("if-wifi", "Wi-Fi", false),
+                vpn_node("vpn-ovpn", VpnProvider::OpenVpn, false, VpnNodeSettings::default()),
+                apps_node("apps-1", &["chrome.exe"]),
+            ],
+            edges: vec![
+                edge("e1", "if-wifi", "vpn-ovpn"),
+                edge("e2", "vpn-ovpn", "apps-1"),
+            ],
+        };
+        runtime.apply(Some("wf-ovpn".to_string()), &ovpn_graph).await.expect("apply");
+
+        // User closes OpenVPN while NetFlow is active -> ephemeral adapter 30 vanishes.
+        ops.mark_interface_vanished(30, 87);
+
+        let status = runtime.stop().await.expect("stop succeeds cleanly");
+        assert_eq!(status.state, RuntimeState::Stopped);
+        assert!(
+            !dir.join("recovery.json").exists(),
+            "recovery.json must be cleared on clean stop after VPN closed"
+        );
+        assert_eq!(ops.snapshot_state().1, initial_proxy);
+
+        // Real Access Denied (5) error during stop must NOT be swallowed and must preserve recovery.json.
+        let ops_denied = Arc::new(MockNetworkOps::new(initial_proxy.clone()));
+        seed_vpn_routes(&ops_denied);
+        ops_denied.seed_interface(12, 25, true, vec![]);
+        let sidecar_denied = Arc::new(MockSidecarRunner::new(Some(Arc::clone(&ops_denied))));
+        let dir_denied = temp_test_dir("stop-access-denied");
+        let runtime_denied = make_runtime(
+            &dir_denied,
+            Arc::new(MockDiscovery::new(base_discovery_snapshot())),
+            Arc::clone(&ops_denied),
+            sidecar_denied,
+        );
+        runtime_denied
+            .apply(Some("wf-denied".to_string()), &ovpn_graph)
+            .await
+            .expect("apply succeeds");
+        ops_denied.set_fail_remove_prefix(Some("0.0.0.0/0"));
+        let err = runtime_denied
+            .stop()
+            .await
+            .expect_err("Access Denied error must not be swallowed");
+        assert!(matches!(err, RuntimeError::RestoreFailed(_)));
+        assert_eq!(runtime_denied.status().state, RuntimeState::Error);
+        assert!(
+            dir_denied.join("recovery.json").exists(),
+            "recovery.json must remain when real restore error occurs"
+        );
+
+        let _ = fs::remove_dir_all(&dir_denied);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_disconnected_always_on_warp_with_adapter_down_fails_preflight_and_triggers_dropped_health() {
+        let dir = temp_test_dir("warp-down-health");
+        let mut snap = base_discovery_snapshot();
+        if let Some(warp) = snap
+            .vpns
+            .iter_mut()
+            .find(|v| v.provider == VpnProvider::CloudflareWarp)
+        {
+            // Simulate always-on warp-svc.exe running while CloudflareWARP adapter is down
+            warp.is_running = true;
+            warp.adapter_is_up = false;
+        }
+        let discovery = Arc::new(MockDiscovery::new(snap));
+        let ops = Arc::new(MockNetworkOps::new(SystemProxySnapshot {
+            proxy_enable: 0,
+            proxy_server: None,
+            proxy_override: None,
+        }));
+        seed_vpn_routes(&ops);
+        let sidecar = Arc::new(MockSidecarRunner::new(Some(Arc::clone(&ops))));
+        let runtime = make_runtime(&dir, Arc::clone(&discovery), Arc::clone(&ops), sidecar);
+
+        let warp_graph = WorkflowGraph {
+            nodes: vec![
+                iface_node("if-wifi", "Wi-Fi", false),
+                vpn_node(
+                    "vpn-warp",
+                    VpnProvider::CloudflareWarp,
+                    false,
+                    VpnNodeSettings {
+                        warp_mode: WarpMode::Tun,
+                        ..Default::default()
+                    },
+                ),
+                apps_node("apps-1", &["chrome.exe"]),
+            ],
+            edges: vec![
+                edge("e1", "if-wifi", "vpn-warp"),
+                edge("e2", "vpn-warp", "apps-1"),
+            ],
+        };
+
+        let err = runtime
+            .apply(Some("wf-warp-down".to_string()), &warp_graph)
+            .await
+            .expect_err("running warp-svc with adapter_is_up=false must fail preflight");
+        assert!(matches!(
+            err,
+            RuntimeError::VpnAdapter(VpnAdapterError::NotRunning(VpnProvider::CloudflareWarp))
+        ));
+
+        // Now bring adapter up, apply, then drop adapter mid-session while is_running stays true.
+        discovery.set_vpn_adapter_up(VpnProvider::CloudflareWarp, true);
+        let mut events = runtime.subscribe_events();
+        runtime
+            .apply(Some("wf-warp-up".to_string()), &warp_graph)
+            .await
+            .expect("apply succeeds when WARP adapter is up");
+
+        discovery.set_vpn_adapter_up(VpnProvider::CloudflareWarp, false);
+        let dropped_status = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(RuntimeEvent::StatusChanged(status)) = events.recv().await {
+                    if status.state == RuntimeState::Warning {
+                        return status;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("health watcher emitted Warning when WARP adapter dropped");
+        assert_eq!(
+            dropped_status.node_health.get("vpn-warp"),
+            Some(&NodeHealth::Dropped)
+        );
+
+        runtime.stop().await.expect("clean stop");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_clash_api_port_zero_dynamically_selects_non_zero_non_9090_port() {
+        assert_eq!(EngineRuntimeConfig::default().clash_api_port, 0);
+
+        let dir = temp_test_dir("dynamic-clash-port");
+        let discovery = Arc::new(MockDiscovery::new(base_discovery_snapshot()));
+        let ops = Arc::new(MockNetworkOps::new(SystemProxySnapshot {
+            proxy_enable: 0,
+            proxy_server: None,
+            proxy_override: None,
+        }));
+        seed_vpn_routes(&ops);
+        let sidecar = Arc::new(MockSidecarRunner::new(Some(Arc::clone(&ops))));
+        let runtime = EngineRuntime::new(
+            discovery,
+            ops,
+            Arc::clone(&sidecar) as Arc<dyn SidecarRunner>,
+            RecoveryStore::new(dir.join("recovery.json")),
+            EngineRuntimeConfig {
+                runtime_dir: dir.join("runtime"),
+                clash_api_port: 0,
+                health_poll_interval: Duration::from_secs(60),
+                tun_ready_attempts: 2,
+                tun_ready_retry_delay: Duration::from_millis(5),
+            },
+        );
+
+        runtime
+            .apply(Some("wf-dyn-port".to_string()), &karing_workflow())
+            .await
+            .expect("apply succeeds with clash_api_port: 0");
+
+        let (_, _, _, last_json) = sidecar.stats();
+        let json = last_json.expect("compiled config written");
+        let controller = json["experimental"]["clash_api"]["external_controller"]
+            .as_str()
+            .expect("external_controller string");
+        let port: u16 = controller
+            .strip_prefix("127.0.0.1:")
+            .expect("loopback host")
+            .parse()
+            .expect("valid port");
+        assert_ne!(port, 0);
+        assert_ne!(port, 9090);
+
+        runtime.stop().await.expect("clean stop");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_chained_openvpn_temporarily_removes_physical_bypass_route_and_restores_on_stop() {
+        let dir = temp_test_dir("chained-ovpn-bypass");
+        let discovery = Arc::new(MockDiscovery::new(base_discovery_snapshot()));
+        let ops = Arc::new(MockNetworkOps::new(SystemProxySnapshot {
+            proxy_enable: 0,
+            proxy_server: None,
+            proxy_override: None,
+        }));
+        seed_vpn_routes(&ops);
+        let wifi_bypass_route = route(12, "203.0.113.10/32", "192.168.1.1", 5, false);
+        let wifi_default_route = route(12, "0.0.0.0/0", "192.168.1.1", 40, false);
+        ops.seed_interface(
+            12,
+            25,
+            true,
+            vec![wifi_default_route.clone(), wifi_bypass_route.clone()],
+        );
+        let sidecar = Arc::new(MockSidecarRunner::new(Some(Arc::clone(&ops))));
+        let runtime = make_runtime(&dir, discovery, Arc::clone(&ops), sidecar);
+
+        let chained_graph = WorkflowGraph {
+            nodes: vec![
+                iface_node("if-wifi", "Wi-Fi", false),
+                vpn_node("vpn-karing", VpnProvider::Karing, false, VpnNodeSettings::default()),
+                vpn_node("vpn-ovpn", VpnProvider::OpenVpn, false, VpnNodeSettings::default()),
+                apps_node("apps-1", &["firefox.exe"]),
+            ],
+            edges: vec![
+                edge("e1", "if-wifi", "vpn-karing"),
+                edge("e2", "vpn-karing", "vpn-ovpn"),
+                edge("e3", "vpn-ovpn", "apps-1"),
+            ],
+        };
+
+        runtime
+            .apply(Some("wf-chained-ovpn".to_string()), &chained_graph)
+            .await
+            .expect("apply chained OpenVPN succeeds");
+
+        // Wi-Fi's /32 bypass route must be removed while active and recorded in recovery.json
+        let wifi_routes_active = ops.snapshot_state().2.get(&12).cloned().unwrap_or_default();
+        assert!(!wifi_routes_active.contains(&wifi_bypass_route));
+        assert!(wifi_routes_active.contains(&wifi_default_route));
+
+        let store = RecoveryStore::new(dir.join("recovery.json"));
+        let saved = store.load().unwrap().expect("recovery snapshot exists");
+        assert_eq!(saved.removed_bypass_routes, vec![wifi_bypass_route.clone()]);
+        assert!(saved.pinned_host_routes.is_empty());
+
+        // Stop must restore Wi-Fi's /32 bypass route and delete recovery.json
+        runtime.stop().await.expect("clean stop");
+        assert!(!dir.join("recovery.json").exists());
+        let wifi_routes_after = ops.snapshot_state().2.get(&12).cloned().unwrap_or_default();
+        assert!(
+            wifi_routes_after.contains(&wifi_bypass_route),
+            "stop() must restore Wi-Fi's /32 bypass route"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
