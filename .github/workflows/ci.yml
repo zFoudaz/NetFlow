@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-and-lint:
+    name: Test & Lint (Windows)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo artifacts
+        uses: swatinem/rust-cache@v2
+
+      - name: Fetch sidecars (sing-box + wintun)
+        shell: pwsh
+        run: ./scripts/fetch-sidecars.ps1
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Run frontend tests
+        run: npm test -- --run
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Run Rust tests
+        run: cargo test --workspace
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings

@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish-release:
+    name: Build & Publish Windows Release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: swatinem/rust-cache@v2
+
+      - name: Fetch sidecars (sing-box + wintun)
+        shell: pwsh
+        run: ./scripts/fetch-sidecars.ps1
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Run tests before building
+        run: |
+          npm test -- --run
+          cargo test --workspace
+
+      - name: Build & publish installers (.exe & .msi)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: v__VERSION__
+          releaseName: "NetFlow v__VERSION__"
+          releaseBody: |
+            ## NetFlow v__VERSION__
+
+            Visual multi-interface per-app & VPN traffic router for Windows 10/11 (x64).
+
+            ### Downloads
+            - **`.exe` (NSIS Setup)** — Recommended installer for Windows 10/11 x64
+            - **`.msi` (Windows Installer)** — Standard MSI package
+
+            > **Note:** NetFlow requires Administrator privileges (UAC) to manage the `NetFlow-TUN` adapter and Windows routing tables.
+          releaseDraft: false
+          prerelease: false
