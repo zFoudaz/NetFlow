@@ -25,6 +25,7 @@ import {
   useNetFlowStore,
 } from "../store/useNetFlowStore";
 import type { RuntimeState } from "../types/workflow";
+import { WindowControls } from "./WindowControls";
 
 type PromptMode =
   | { kind: "new" }
@@ -213,11 +214,14 @@ export function TopBar() {
   };
 
   return (
-    <header className="relative z-30 flex flex-col border-b border-[#232830] bg-[#111418] text-[#F3F4F6]">
-      <div className="flex h-12 flex-wrap items-center justify-between gap-2 px-4">
+    <header className="relative z-30 flex flex-col border-b border-[#232830] bg-[#111418] text-[#F3F4F6] select-none">
+      <div
+        data-tauri-drag-region
+        className="flex h-12 flex-nowrap items-center justify-between gap-2 pl-3 pr-0"
+      >
         {/* Left: Workflow Switcher + Canvas Utilities */}
-        <div className="flex items-center gap-2">
-          <div className="relative">
+        <div className="flex min-w-0 items-center gap-1.5">
+          <div className="relative min-w-0">
             <button
               type="button"
               onClick={() => {
@@ -226,14 +230,14 @@ export function TopBar() {
               }}
               aria-expanded={menuOpen}
               aria-label="Workflow Switcher"
-              className="inline-flex h-8 items-center gap-2 rounded-md border border-[#232830] bg-[#161A20] px-2.5 text-xs font-medium text-[#F3F4F6] transition hover:border-[#2E3540] hover:bg-[#1D222B]"
+              className="inline-flex h-8 min-w-0 max-w-full items-center gap-2 whitespace-nowrap rounded-md border border-[#232830] bg-[#161A20] px-2.5 text-xs font-medium text-[#F3F4F6] transition hover:border-[#2E3540] hover:bg-[#1D222B]"
             >
-              <Folder className="h-3.5 w-3.5 text-[#9CA3AF]" />
-              <span className="max-w-44 truncate">
+              <Folder className="h-3.5 w-3.5 shrink-0 text-[#9CA3AF]" />
+              <span className="max-w-28 truncate xl:max-w-44">
                 {currentWorkflowName}
                 {isDirty ? " *" : ""}
               </span>
-              <ChevronDown className="h-3.5 w-3.5 text-[#6B7280]" />
+              <ChevronDown className="h-3.5 w-3.5 shrink-0 text-[#6B7280]" />
             </button>
 
             {menuOpen && (
@@ -356,52 +360,55 @@ export function TopBar() {
             )}
           </div>
 
-          <div className="h-4 w-px bg-[#232830]" />
+          <div className="hidden h-4 w-px shrink-0 bg-[#232830] lg:block" />
 
           <button
             type="button"
+            title="Fit View"
             onClick={requestFitView}
-            className="inline-flex h-8 items-center gap-1.5 rounded-md border border-[#232830] bg-[#161A20] px-2.5 text-xs font-medium text-[#9CA3AF] transition hover:border-[#2E3540] hover:bg-[#1D222B] hover:text-[#F3F4F6]"
+            className="inline-flex h-8 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border border-[#232830] bg-[#161A20] px-2 text-xs font-medium text-[#9CA3AF] transition hover:border-[#2E3540] hover:bg-[#1D222B] hover:text-[#F3F4F6] xl:px-2.5"
           >
-            <Maximize2 className="h-3.5 w-3.5" />
-            <span>Fit View</span>
+            <Maximize2 className="h-3.5 w-3.5 shrink-0" />
+            <span className="hidden xl:inline">Fit View</span>
           </button>
 
           <button
             type="button"
+            title={validatedOk ? "Valid" : "Validate"}
             onClick={() => void handleValidate()}
-            className={`inline-flex h-8 items-center gap-1.5 rounded-md border px-2.5 text-xs font-medium transition ${
+            className={`inline-flex h-8 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border px-2 text-xs font-medium transition xl:px-2.5 ${
               validatedOk
                 ? "border-[#3ECF8E]/40 bg-[#3ECF8E]/10 text-[#3ECF8E]"
                 : "border-[#232830] bg-[#161A20] text-[#9CA3AF] hover:border-[#2E3540] hover:bg-[#1D222B] hover:text-[#F3F4F6]"
             }`}
           >
-            <CheckCircle2 className={`h-3.5 w-3.5 ${validatedOk ? "text-[#3ECF8E]" : "text-[#3ECF8E]"}`} />
-            <span>{validatedOk ? "Valid" : "Validate"}</span>
+            <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-[#3ECF8E]" />
+            <span className="hidden xl:inline">{validatedOk ? "Valid" : "Validate"}</span>
           </button>
         </div>
 
         {/* Right: Status Pill, Live Traffic, Start/Apply, Stop */}
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex shrink-0 flex-nowrap items-center gap-1.5">
           <div
-            className={`inline-flex h-7 items-center gap-1.5 rounded-md border px-2.5 text-[11px] font-medium ${statusMeta.pillClass}`}
+            className={`inline-flex h-7 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border px-2.5 text-[11px] font-medium ${statusMeta.pillClass}`}
           >
-            <span className={`h-1.5 w-1.5 rounded-full ${statusMeta.dotClass}`} />
+            <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${statusMeta.dotClass}`} />
             <span>{statusMeta.label}</span>
           </div>
 
           <button
             type="button"
+            title="Live Traffic"
             onClick={toggleTrafficDrawer}
             aria-pressed={isTrafficDrawerOpen}
-            className={`inline-flex h-8 items-center gap-1.5 rounded-md border px-2.5 text-xs font-medium transition ${
+            className={`inline-flex h-8 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border px-2 text-xs font-medium transition lg:px-2.5 ${
               isTrafficDrawerOpen
                 ? "border-[#14B8A6]/50 bg-[#14B8A6]/10 text-[#2DD4BF]"
                 : "border-[#232830] bg-[#161A20] text-[#9CA3AF] hover:border-[#2E3540] hover:bg-[#1D222B] hover:text-[#F3F4F6]"
             }`}
           >
-            <Activity className="h-3.5 w-3.5" />
-            <span>Live Traffic</span>
+            <Activity className="h-3.5 w-3.5 shrink-0" />
+            <span className="hidden lg:inline">Live Traffic</span>
             {liveConnections.length > 0 && (
               <span className="rounded bg-[#232830] px-1.5 py-0.5 font-mono text-[10px] text-[#F3F4F6]">
                 {liveConnections.length}
@@ -411,25 +418,26 @@ export function TopBar() {
 
           <button
             type="button"
+            title="Stop routing"
             disabled={engineStatus.state === "stopped"}
             onClick={() => void stopRouting()}
-            className="inline-flex h-8 items-center gap-1.5 rounded-md border border-[#232830] bg-[#161A20] px-2.5 text-xs font-medium text-[#9CA3AF] transition hover:border-rose-500/40 hover:bg-rose-500/10 hover:text-rose-300 disabled:cursor-not-allowed disabled:opacity-40"
+            className="inline-flex h-8 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border border-[#232830] bg-[#161A20] px-2 text-xs font-medium text-[#9CA3AF] transition hover:border-rose-500/40 hover:bg-rose-500/10 hover:text-rose-300 disabled:cursor-not-allowed disabled:opacity-40 lg:px-2.5"
           >
-            <Square className="h-3.5 w-3.5" />
-            <span>Stop</span>
+            <Square className="h-3.5 w-3.5 shrink-0" />
+            <span className="hidden lg:inline">Stop</span>
           </button>
 
           <button
             type="button"
             disabled={applyingNow}
             onClick={() => void applyCurrentWorkflow()}
-            className={`inline-flex h-8 items-center gap-1.5 rounded-md px-3.5 text-xs font-semibold text-[#0B0D10] transition disabled:cursor-not-allowed disabled:opacity-50 ${
+            className={`inline-flex h-8 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 text-xs font-semibold text-[#0B0D10] transition disabled:cursor-not-allowed disabled:opacity-50 lg:px-3.5 ${
               hasUnappliedChanges && !applyingNow
                 ? "bg-amber-400 hover:bg-amber-300"
                 : "bg-[#3ECF8E] hover:bg-[#34B87E]"
             }`}
           >
-            <Play className="h-3.5 w-3.5 fill-current" />
+            <Play className="h-3.5 w-3.5 shrink-0 fill-current" />
             <span>
               {applyingNow
                 ? "Applying..."
@@ -439,7 +447,7 @@ export function TopBar() {
             </span>
           </button>
 
-          <div className="relative">
+          <div className="relative shrink-0">
             <button
               type="button"
               aria-label="Settings"
@@ -560,6 +568,8 @@ export function TopBar() {
               </div>
             )}
           </div>
+
+          <WindowControls />
         </div>
       </div>
 

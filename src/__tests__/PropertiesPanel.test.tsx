@@ -329,4 +329,24 @@ describe("PropertiesPanel", () => {
     expect(useNetFlowStore.getState().savedAppGroups[0].name).toBe("Work Apps");
     expect(await within(panel).findByText("Saved to Sidebar")).toBeTruthy();
   });
+
+  it("hides and restores the right sidebar via toggle button and reopens on node click", async () => {
+    const user = userEvent.setup();
+    render(<PropertiesPanel />);
+
+    expect(screen.getByLabelText("Workflow Properties")).toBeTruthy();
+
+    await user.click(screen.getByRole("button", { name: /Hide right sidebar/i }));
+    expect(screen.queryByLabelText("Workflow Properties")).toBeNull();
+
+    const showBtn = screen.getByRole("button", { name: /Show right sidebar/i });
+    await user.click(showBtn);
+    expect(screen.getByLabelText("Workflow Properties")).toBeTruthy();
+
+    // Hide again, then simulate clicking a node on canvas -> automatically opens Node Properties
+    await user.click(screen.getByRole("button", { name: /Hide right sidebar/i }));
+    expect(screen.queryByLabelText("Workflow Properties")).toBeNull();
+    useNetFlowStore.getState().setSelectedNodeId("iface-wifi");
+    expect(await screen.findByLabelText("Node Properties")).toBeTruthy();
+  });
 });

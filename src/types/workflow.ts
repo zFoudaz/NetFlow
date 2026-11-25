@@ -1,7 +1,8 @@
-export type VpnProvider = "karing" | "openVpn";
+export type VpnProvider = "karing" | "openVpn" | "nekoRay";
 
 export interface VpnNodeSettings {
   karingPortOverride?: number | null;
+  nekorayPortOverride?: number | null;
   openvpnAdapterOverride?: string | null;
   openvpnServerIpOverride?: string | null;
 }
@@ -23,6 +24,9 @@ export type NodeKind =
       apps: string[];
       label?: string | null;
       iconDataUrl?: string | null;
+    }
+  | {
+      type: "hotspot";
     };
 
 export interface WorkflowNode {
@@ -104,11 +108,18 @@ export interface DetectedAppInfo {
   iconDataUrl: string | null;
 }
 
+export interface DetectedHotspotInfo {
+  isActive: boolean;
+  adapterAlias: string | null;
+  ipv4: string | null;
+}
+
 export interface DiscoverySnapshot {
   interfaces: PhysicalInterfaceInfo[];
   vpns: DetectedVpnInfo[];
   processes: RunningProcessInfo[];
   openApps?: DetectedAppInfo[];
+  hotspot?: DetectedHotspotInfo | null;
 }
 
 export interface AppSettings {

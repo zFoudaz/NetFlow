@@ -68,6 +68,15 @@ pub struct VpnRecoveryEntry {
     pub metric_snapshots: Vec<InterfaceMetricSnapshot>,
 }
 
+/// Pre-NetFlow Windows Internet Connection Sharing state for Mobile Hotspot routing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HotspotIcsRecovery {
+    pub public_alias: String,
+    pub private_alias: String,
+    pub previous_public_alias: Option<String>,
+}
+
 /// Full crash-recovery snapshot persisted before NetFlow mutates OS network state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -82,6 +91,8 @@ pub struct RecoverySnapshot {
     pub physical_metric_snapshots: Vec<InterfaceMetricSnapshot>,
     #[serde(default)]
     pub singbox_pid: Option<u32>,
+    #[serde(default)]
+    pub hotspot_ics: Option<HotspotIcsRecovery>,
 }
 
 impl RecoverySnapshot {
@@ -273,6 +284,7 @@ mod tests {
             }],
             physical_metric_snapshots: Vec::new(),
             singbox_pid: Some(4242),
+            hotspot_ics: None,
         };
 
         store.save_atomic(&snapshot).expect("save atomic");
@@ -322,6 +334,7 @@ mod tests {
             removed_bypass_routes: Vec::new(),
             physical_metric_snapshots: Vec::new(),
             singbox_pid: None,
+            hotspot_ics: None,
         };
 
         let baseline_karing = VpnRecoveryEntry {

@@ -28,6 +28,8 @@ pub enum VpnAdapterError {
     },
     #[error("missing SOCKS5 port for Karing; enable Karing or configure a port override")]
     MissingKaringPort,
+    #[error("missing SOCKS5 port for NekoRay; enable NekoRay or configure a port override")]
+    MissingNekoRayPort,
     #[error("missing network interface index for {provider:?}")]
     MissingAdapterIfIndex { provider: VpnProvider },
     #[error("missing virtual adapter alias for OpenVPN")]
@@ -71,6 +73,21 @@ pub fn preflight_and_resolve_vpn(
             Ok(ResolvedVpnRuntimeInfo {
                 provider: VpnProvider::Karing,
                 karing_socks_port: Some(port),
+                nekoray_socks_port: None,
+                openvpn_adapter_alias: None,
+                openvpn_server_ip: None,
+            })
+        }
+        VpnProvider::NekoRay => {
+            let port = settings
+                .nekoray_port_override
+                .filter(|&p| p != 0)
+                .or_else(|| detected.detected_port.filter(|&p| p != 0))
+                .ok_or(VpnAdapterError::MissingNekoRayPort)?;
+            Ok(ResolvedVpnRuntimeInfo {
+                provider: VpnProvider::NekoRay,
+                karing_socks_port: None,
+                nekoray_socks_port: Some(port),
                 openvpn_adapter_alias: None,
                 openvpn_server_ip: None,
             })
@@ -89,6 +106,7 @@ pub fn preflight_and_resolve_vpn(
             Ok(ResolvedVpnRuntimeInfo {
                 provider: VpnProvider::OpenVpn,
                 karing_socks_port: None,
+                nekoray_socks_port: None,
                 openvpn_adapter_alias: Some(alias),
                 openvpn_server_ip: server_ip,
             })
@@ -117,13 +135,13 @@ pub fn neutralize_vpn(
     }
 
     match provider {
-        VpnProvider::Karing => {
+        VpnProvider::Karing | VpnProvider::NekoRay => {
             let Some(if_index) = detected.adapter_if_index else {
-                return Ok(empty_recovery_entry(VpnProvider::Karing));
+                return Ok(empty_recovery_entry(provider));
             };
             neutralize_tun_adapter(
                 ops,
-                VpnProvider::Karing,
+                provider,
                 if_index,
                 detected.adapter_gateway.as_deref(),
                 should_neutralize_split_or_default_route,
@@ -978,6 +996,39 @@ mod tests {
             .expect("karing socks-only neutralize");
         assert!(entry.removed_routes.is_empty());
         assert!(entry.added_routes.is_empty());
+
+        // NekoRay with TUN adapter neutralizes hijack routes and restores them cleanly
+        let neko_if = 31;
+        let neko_ops = MockNetworkOps::with_routes(vec![
+            route(neko_if, "0.0.0.0/0", "172.19.0.2", 0, false),
+            route(neko_if, "172.19.0.0/28", "0.0.0.0", 256, false),
+        ]);
+        neko_ops.set_metric(neko_if, false, 5, false);
+        let neko_detected = DetectedVpnInfo {
+            provider: VpnProvider::NekoRay,
+            is_running: true,
+            detected_port: Some(2080),
+            adapter_alias: Some("nekoray-tun".to_string()),
+            adapter_if_index: Some(neko_if),
+            adapter_is_up: true,
+            adapter_gateway: Some("172.19.0.2".to_string()),
+            remote_server_ip: None,
+        };
+        let neko_settings = VpnNodeSettings {
+            nekoray_port_override: Some(2090),
+            ..Default::default()
+        };
+        let resolved_neko =
+            preflight_and_resolve_vpn(VpnProvider::NekoRay, &neko_settings, &neko_detected)
+                .expect("nekoray override");
+        assert_eq!(resolved_neko.nekoray_socks_port, Some(2090));
+        let neko_recovery = neutralize_vpn(&neko_ops, VpnProvider::NekoRay, &resolved_neko, &neko_detected)
+            .expect("nekoray tun neutralize");
+        assert_eq!(neko_recovery.provider, VpnProvider::NekoRay);
+        assert_eq!(neko_recovery.removed_routes.len(), 1);
+        assert_eq!(neko_ops.metric_for(neko_if, false).original_metric, 500);
+        restore_vpn(&neko_ops, &neko_recovery).expect("nekoray restore");
+        assert_eq!(neko_ops.metric_for(neko_if, false).original_metric, 5);
 
         // OpenVPN overrides
         let ovpn_detected = DetectedVpnInfo {

@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { LiveTrafficDrawer } from "../components/LiveTrafficDrawer";
@@ -300,5 +300,30 @@ describe("LiveTrafficDrawer", () => {
     // Click Up / Down header -> defaults to descending (largest total bytes first)
     await user.click(screen.getByRole("button", { name: /^Up \/ Down$/i }));
     expect(getRowProcesses()).toEqual(["aria2c.exe", "discord.exe", "steam.exe"]);
+  });
+
+  it("resizes vertically via drag handle, clamps to min height, and resets on double-click", () => {
+    useNetFlowStore.setState({ isTrafficDrawerOpen: true });
+    render(<LiveTrafficDrawer />);
+
+    const drawer = screen.getByLabelText("Live Traffic Log");
+    const handle = screen.getByRole("separator", { name: /Resize Live Traffic drawer/i });
+    expect(drawer.style.height).toBe("256px");
+
+    // Drag upward by 100px -> height increases to 356px
+    fireEvent.mouseDown(handle, { clientY: 500 });
+    fireEvent.mouseMove(window, { clientY: 400 });
+    fireEvent.mouseUp(window);
+    expect(drawer.style.height).toBe("356px");
+
+    // Drag downward past minimum -> clamps at 140px
+    fireEvent.mouseDown(handle, { clientY: 400 });
+    fireEvent.mouseMove(window, { clientY: 800 });
+    fireEvent.mouseUp(window);
+    expect(drawer.style.height).toBe("140px");
+
+    // Double-click handle -> resets to 256px
+    fireEvent.doubleClick(handle);
+    expect(drawer.style.height).toBe("256px");
   });
 });

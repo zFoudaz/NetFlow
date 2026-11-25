@@ -696,6 +696,7 @@ mod tests {
                         path: Some(r"C:\Program Files\Google\Chrome\Application\chrome.exe".into()),
                     }],
                     open_apps: Vec::new(),
+                    hotspot: None,
                 },
             }
         }
@@ -1190,6 +1191,7 @@ mod tests {
             removed_bypass_routes: Vec::new(),
             physical_metric_snapshots: Vec::new(),
             singbox_pid: None,
+            hotspot_ics: None,
         };
         RecoveryStore::new(recovery_path.clone())
             .save_atomic(&stale)

@@ -20,7 +20,8 @@ use crate::model::{
     NodeKind, ValidatedGraph, ValidatedVpnChain, ValidationError, VpnProvider, WorkflowGraph,
 };
 use crate::recovery::{
-    InterfaceMetricSnapshot, RecoveryError, RecoverySnapshot, RecoveryStore, RouteRecord,
+    HotspotIcsRecovery, InterfaceMetricSnapshot, RecoveryError, RecoverySnapshot, RecoveryStore,
+    RouteRecord,
 };
 use crate::storage::{default_netflow_dir, write_atomic};
 use crate::traffic::{LiveConnection, TrafficMonitor};
@@ -35,7 +36,9 @@ use crate::win_net::{
 };
 
 const TUN_INTERFACE_ALIAS: &str = "NetFlow-TUN";
-const TUN_GATEWAY_IPV4: &str = "172.19.0.2";
+const TUN_GATEWAY_IPV4: &str = "172.29.0.2";
+const HOTSPOT_TUN_INTERFACE_ALIAS: &str = "NetFlow-Hotspot-TUN";
+const HOTSPOT_TUN_GATEWAY_IPV4: &str = "172.29.1.2";
 const DEFAULT_CLASH_API_PORT: u16 = 0;
 const FALLBACK_CLASH_API_PORT: u16 = 19090;
 #[cfg(windows)]
@@ -747,6 +750,7 @@ impl EngineRuntime {
                 removed_bypass_routes: Vec::new(),
                 physical_metric_snapshots: Vec::new(),
                 singbox_pid: None,
+                hotspot_ics: None,
             };
             let store = self.recovery_store.clone();
             let snap_for_save = snap.clone();
@@ -816,6 +820,10 @@ impl EngineRuntime {
         }
 
         if let Err(err) = self.ensure_tun_route_priority().await {
+            return Err(self.rollback_on_apply_failure(&snapshot, err).await);
+        }
+
+        if let Err(err) = self.ensure_hotspot_setup(&prepared, &mut snapshot).await {
             return Err(self.rollback_on_apply_failure(&snapshot, err).await);
         }
 
@@ -961,8 +969,15 @@ impl EngineRuntime {
                 .iter()
                 .map(|c| c.provider)
                 .collect();
+            let keep_hotspot = prepared.validated.hotspot_target_node_id.is_some();
             run_snapshot_blocking(snapshot, move |local_snap| {
-                reconcile_hot_switch_removals_blocking(&*net_ops, &store, &new_providers, local_snap)
+                reconcile_hot_switch_removals_blocking(
+                    &*net_ops,
+                    &store,
+                    &new_providers,
+                    keep_hotspot,
+                    local_snap,
+                )
             })
             .await?;
         }
@@ -1029,6 +1044,72 @@ impl EngineRuntime {
         }
 
         Err(RuntimeError::TunInterfaceNotReady)
+    }
+
+    async fn ensure_hotspot_setup(
+        &self,
+        prepared: &PreparedApply,
+        snapshot: &mut RecoverySnapshot,
+    ) -> Result<(), RuntimeError> {
+        if prepared.validated.hotspot_target_node_id.is_none() {
+            return Ok(());
+        }
+
+        let attempts = self.config.tun_ready_attempts.max(1);
+        for attempt in 0..attempts {
+            let net_ops = Arc::clone(&self.net_ops);
+            let ready = run_blocking(move || {
+                let Some(hs_idx) =
+                    net_ops.find_interface_index_by_alias(HOTSPOT_TUN_INTERFACE_ALIAS)?
+                else {
+                    return Ok(false);
+                };
+                net_ops.set_interface_metric(hs_idx, false, 500, false)?;
+                let route = RouteRecord {
+                    interface_index: hs_idx,
+                    destination_prefix: "0.0.0.0/0".to_string(),
+                    next_hop: HOTSPOT_TUN_GATEWAY_IPV4.to_string(),
+                    route_metric: 500,
+                    is_ipv6: false,
+                };
+                add_or_replace_route(&*net_ops, &route)?;
+                Ok::<bool, RuntimeError>(true)
+            })
+            .await?;
+
+            if ready {
+                break;
+            }
+            if attempt + 1 < attempts && !self.config.tun_ready_retry_delay.is_zero() {
+                tokio::time::sleep(self.config.tun_ready_retry_delay).await;
+            }
+        }
+
+        if let Some(ref hotspot) = prepared.discovery_snap.hotspot {
+            if hotspot.is_active {
+                if let Some(ref private_alias) = hotspot.adapter_alias {
+                    let net_ops = Arc::clone(&self.net_ops);
+                    let store = self.recovery_store.clone();
+                    let private_alias = private_alias.clone();
+                    run_snapshot_blocking(snapshot, move |local_snap| {
+                        let prev_pub = net_ops
+                            .configure_hotspot_ics(HOTSPOT_TUN_INTERFACE_ALIAS, &private_alias)?;
+                        if local_snap.hotspot_ics.is_none() {
+                            local_snap.hotspot_ics = Some(HotspotIcsRecovery {
+                                public_alias: HOTSPOT_TUN_INTERFACE_ALIAS.to_string(),
+                                private_alias,
+                                previous_public_alias: prev_pub,
+                            });
+                            store.save_atomic(local_snap)?;
+                        }
+                        Ok(())
+                    })
+                    .await?;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     async fn rollback_on_apply_failure(
@@ -1440,9 +1521,18 @@ fn reconcile_hot_switch_removals_blocking(
     net_ops: &dyn WindowsNetworkOps,
     recovery_store: &RecoveryStore,
     new_providers: &HashSet<VpnProvider>,
+    keep_hotspot: bool,
     snapshot: &mut RecoverySnapshot,
 ) -> Result<(), RuntimeError> {
     net_ops.disable_system_proxy()?;
+
+    if !keep_hotspot {
+        if let Some(ics) = snapshot.hotspot_ics.take() {
+            net_ops
+                .restore_hotspot_ics(ics.previous_public_alias.as_deref(), &ics.private_alias)?;
+            recovery_store.save_atomic(snapshot)?;
+        }
+    }
 
     if !snapshot.pinned_host_routes.is_empty() {
         while let Some(route) = snapshot.pinned_host_routes.last().cloned() {
@@ -1460,7 +1550,10 @@ fn reconcile_hot_switch_removals_blocking(
         recovery_store.save_atomic(snapshot)?;
     }
 
-    if !new_providers.contains(&VpnProvider::Karing) && !snapshot.physical_metric_snapshots.is_empty() {
+    if !new_providers.contains(&VpnProvider::Karing)
+        && !new_providers.contains(&VpnProvider::NekoRay)
+        && !snapshot.physical_metric_snapshots.is_empty()
+    {
         while let Some(metric_snap) = snapshot.physical_metric_snapshots.last().cloned() {
             restore_metric_ignore_missing(net_ops, &metric_snap)?;
             snapshot.physical_metric_snapshots.pop();
@@ -1544,7 +1637,7 @@ fn maybe_prioritize_karing_upstream_interface_blocking(
     chain: &crate::model::ValidatedVpnChain,
     snapshot: &mut RecoverySnapshot,
 ) -> Result<(), RuntimeError> {
-    if chain.provider != VpnProvider::Karing {
+    if !matches!(chain.provider, VpnProvider::Karing | VpnProvider::NekoRay) {
         return Ok(());
     }
 
@@ -1678,7 +1771,7 @@ fn maybe_pin_openvpn_route_blocking(
                 recovery_store.save_atomic(snapshot)?;
             }
         }
-        NodeKind::Apps { .. } => {}
+        NodeKind::Apps { .. } | NodeKind::Hotspot {} => {}
     }
     Ok(())
 }
@@ -1769,6 +1862,10 @@ fn is_vpn_node_healthy(chain: &ValidatedVpnChain, info: &DetectedVpnInfo) -> boo
             info.detected_port.is_some()
                 || chain.settings.karing_port_override.is_some_and(|p| p != 0)
         }
+        VpnProvider::NekoRay => {
+            info.detected_port.is_some()
+                || chain.settings.nekoray_port_override.is_some_and(|p| p != 0)
+        }
         VpnProvider::OpenVpn => info.adapter_is_up,
     }
 }
@@ -1777,6 +1874,7 @@ fn provider_display_name(provider: VpnProvider) -> &'static str {
     match provider {
         VpnProvider::Karing => "Karing",
         VpnProvider::OpenVpn => "OpenVPN",
+        VpnProvider::NekoRay => "NekoRay",
     }
 }
 
@@ -1871,6 +1969,14 @@ fn restore_snapshot_state(
     for entry in snapshot.vpn_entries.values() {
         if let Err(err) = restore_vpn(ops, entry) {
             errors.push(format!("restore {:?}: {err}", entry.provider));
+        }
+    }
+
+    if let Some(ref ics) = snapshot.hotspot_ics {
+        if let Err(err) =
+            ops.restore_hotspot_ics(ics.previous_public_alias.as_deref(), &ics.private_alias)
+        {
+            errors.push(format!("restore hotspot ICS: {err}"));
         }
     }
 
@@ -2479,6 +2585,7 @@ mod tests {
             ],
             processes: vec![],
             open_apps: vec![],
+            hotspot: None,
         }
     }
 
@@ -2715,6 +2822,7 @@ mod tests {
                 removed_bypass_routes: Vec::new(),
                 physical_metric_snapshots: Vec::new(),
                 singbox_pid: None,
+                hotspot_ics: None,
             })
             .expect("seed stale recovery.json");
 
@@ -3347,6 +3455,7 @@ mod tests {
                 removed_bypass_routes: Vec::new(),
                 physical_metric_snapshots: Vec::new(),
                 singbox_pid: Some(999999),
+                hotspot_ics: None,
             })
             .expect("seed recovery snapshot");
 

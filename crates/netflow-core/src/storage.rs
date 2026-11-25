@@ -317,6 +317,7 @@ mod tests {
                         is_default: true,
                         settings: VpnNodeSettings {
                             karing_port_override: Some(3067),
+                            nekoray_port_override: None,
                             openvpn_adapter_override: None,
                             openvpn_server_ip_override: None,
                         },

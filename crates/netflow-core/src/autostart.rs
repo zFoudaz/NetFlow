@@ -86,7 +86,7 @@ pub fn build_task_scheduler_xml(exe_path: &Path, args: &str) -> Result<String, A
     };
 
     Ok(format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
+        r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <Triggers>
     <LogonTrigger>
@@ -152,6 +152,15 @@ impl WindowsTaskSchedulerAutoStart {
     }
 }
 
+fn encode_utf16le_with_bom(text: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(2 + text.len() * 2);
+    bytes.extend_from_slice(&[0xFF, 0xFE]);
+    for unit in text.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes
+}
+
 fn new_schtasks_command() -> Command {
     let mut cmd = Command::new("schtasks.exe");
     #[cfg(windows)]
@@ -205,7 +214,7 @@ impl AutoStartManager for WindowsTaskSchedulerAutoStart {
             "netflow-autostart-{}.xml",
             Uuid::new_v4()
         ));
-        fs::write(&tmp_path, xml.as_bytes())?;
+        fs::write(&tmp_path, encode_utf16le_with_bom(&xml))?;
 
         let output = new_schtasks_command()
             .args(["/Create", "/TN", &self.task_name, "/XML"])
@@ -241,6 +250,7 @@ mod tests {
         let exe = PathBuf::from(r#"C:\Program Files\NetFlow & Co\Net"Flow.exe"#);
         let xml = build_task_scheduler_xml(&exe, AUTOSTART_ARG).expect("valid xml");
 
+        assert!(xml.starts_with(r#"<?xml version="1.0" encoding="UTF-16"?>"#));
         assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
         assert!(xml.contains("<RunLevel>HighestAvailable</RunLevel>"));
         assert!(xml.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"));
@@ -260,5 +270,17 @@ mod tests {
         let err = build_task_scheduler_xml(Path::new("   "), AUTOSTART_ARG)
             .expect_err("empty exe path should fail");
         assert!(matches!(err, AutoStartError::InvalidExecutablePath(_)));
+    }
+
+    #[test]
+    fn test_encode_utf16le_with_bom_roundtrips() {
+        let sample = "<?xml version=\"1.0\" encoding=\"UTF-16\"?><Task>NetFlow — UTF16</Task>";
+        let encoded = encode_utf16le_with_bom(sample);
+        assert_eq!(&encoded[..2], &[0xFF, 0xFE]);
+        let units: Vec<u16> = encoded[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(String::from_utf16(&units).expect("valid utf-16"), sample);
     }
 }

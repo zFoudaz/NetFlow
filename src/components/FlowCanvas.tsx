@@ -20,22 +20,27 @@ import {
 import { useCallback, useEffect, useRef, useState, type DragEvent, type MouseEvent } from "react";
 import { useNetFlowStore } from "../store/useNetFlowStore";
 import type { EngineStatus, WorkflowEdge, WorkflowNode } from "../types/workflow";
+import { CanvasContextMenu } from "./CanvasContextMenu";
 import { DeletableEdge } from "./edges/DeletableEdge";
 import { AppsNode, type AppsFlowNode } from "./nodes/AppsNode";
+import { HotspotNode, type HotspotFlowNode } from "./nodes/HotspotNode";
 import { InterfaceNode, type InterfaceFlowNode } from "./nodes/InterfaceNode";
 import {
   createWorkflowNode,
+  getConflictingVpnProvider,
   NETFLOW_DND_MIME,
   parseDragNodePayload,
+  type DragNodePayload,
 } from "./nodes/nodeShared";
 import { VpnNode, type VpnFlowNode } from "./nodes/VpnNode";
 
-export type FlowNode = InterfaceFlowNode | VpnFlowNode | AppsFlowNode;
+export type FlowNode = InterfaceFlowNode | VpnFlowNode | AppsFlowNode | HotspotFlowNode;
 
 const nodeTypes: NodeTypes = {
   interface: InterfaceNode as NodeTypes[string],
   vpn: VpnNode as NodeTypes[string],
   apps: AppsNode as NodeTypes[string],
+  hotspot: HotspotNode as NodeTypes[string],
 };
 
 const edgeTypes: EdgeTypes = {
@@ -105,7 +110,11 @@ export function isValidWorkflowConnection(
     return false;
   }
 
-  if (sourceNode.kind.type === "apps" || targetNode.kind.type === "interface") {
+  if (
+    sourceNode.kind.type === "apps" ||
+    sourceNode.kind.type === "hotspot" ||
+    targetNode.kind.type === "interface"
+  ) {
     return false;
   }
 
@@ -197,6 +206,12 @@ function FlowCanvasInner() {
   const setSelectedNodeId = useNetFlowStore((s) => s.setSelectedNodeId);
 
   const { screenToFlowPosition, fitView } = useReactFlow<FlowNode, Edge>();
+  const dropzoneRef = useRef<HTMLDivElement | null>(null);
+  const [contextMenu, setContextMenu] = useState<{
+    x: number;
+    y: number;
+    flowPosition: { x: number; y: number };
+  } | null>(null);
 
   const rfNodesRef = useRef<FlowNode[]>(toFlowNodes(graph.nodes, [], selectedNodeId));
   const [rfNodes, setRfNodes] = useState<FlowNode[]>(rfNodesRef.current);
@@ -312,14 +327,59 @@ function FlowCanvasInner() {
 
   const onNodeClick = useCallback(
     (_event: MouseEvent, node: FlowNode) => {
+      setContextMenu(null);
       setSelectedNodeId(node.id);
     },
     [setSelectedNodeId]
   );
 
   const onPaneClick = useCallback(() => {
+    setContextMenu(null);
     setSelectedNodeId(null);
   }, [setSelectedNodeId]);
+
+  const onPaneContextMenu = useCallback(
+    (event: globalThis.MouseEvent | MouseEvent) => {
+      event.preventDefault();
+      const rect = dropzoneRef.current?.getBoundingClientRect();
+      const rawX = rect ? event.clientX - rect.left : event.clientX;
+      const rawY = rect ? event.clientY - rect.top : event.clientY;
+      const menuWidth = 240;
+      const menuHeight = 320;
+      const maxX = rect ? Math.max(8, rect.width - menuWidth - 8) : rawX;
+      const maxY = rect ? Math.max(8, rect.height - menuHeight - 8) : rawY;
+      const x = Math.min(Math.max(8, rawX), maxX);
+      const y = Math.min(Math.max(8, rawY), maxY);
+
+      const rawFlow = screenToFlowPosition({ x: event.clientX, y: event.clientY });
+      const flowPosition = {
+        x: Number.isFinite(rawFlow.x) ? rawFlow.x : 160,
+        y: Number.isFinite(rawFlow.y) ? rawFlow.y : 160,
+      };
+      setContextMenu({ x, y, flowPosition });
+    },
+    [screenToFlowPosition]
+  );
+
+  const handleAddNodeFromContextMenu = useCallback(
+    (payload: DragNodePayload) => {
+      if (!contextMenu) return;
+      const latestNodes = useNetFlowStore.getState().graph.nodes;
+      if (
+        (payload.type === "vpn" &&
+          (latestNodes.some((n) => n.kind.type === "vpn" && n.kind.provider === payload.provider) ||
+            getConflictingVpnProvider(payload.provider, latestNodes) !== null)) ||
+        (payload.type === "hotspot" && latestNodes.some((n) => n.kind.type === "hotspot"))
+      ) {
+        return;
+      }
+      const created = createWorkflowNode(payload, contextMenu.flowPosition);
+      addNode(created);
+      setSelectedNodeId(created.id);
+      setContextMenu(null);
+    },
+    [addNode, contextMenu, setSelectedNodeId]
+  );
 
   const isValidConnection = useCallback<IsValidConnection<Edge>>((edgeOrConnection) => {
     const latestGraph = useNetFlowStore.getState().graph;
@@ -375,8 +435,10 @@ function FlowCanvasInner() {
 
       const latestNodes = useNetFlowStore.getState().graph.nodes;
       if (
-        payload.type === "vpn" &&
-        latestNodes.some((n) => n.kind.type === "vpn" && n.kind.provider === payload.provider)
+        (payload.type === "vpn" &&
+          (latestNodes.some((n) => n.kind.type === "vpn" && n.kind.provider === payload.provider) ||
+            getConflictingVpnProvider(payload.provider, latestNodes) !== null)) ||
+        (payload.type === "hotspot" && latestNodes.some((n) => n.kind.type === "hotspot"))
       ) {
         return;
       }
@@ -413,6 +475,7 @@ function FlowCanvasInner() {
 
   return (
     <div
+      ref={dropzoneRef}
       data-testid="flow-canvas-dropzone"
       onDragOver={onDragOver}
       onDrop={onDrop}
@@ -428,6 +491,7 @@ function FlowCanvasInner() {
         onSelectionChange={onSelectionChange}
         onNodeClick={onNodeClick}
         onPaneClick={onPaneClick}
+        onPaneContextMenu={onPaneContextMenu}
         onEdgeContextMenu={onEdgeContextMenu}
         onConnect={onConnect}
         isValidConnection={isValidConnection}
@@ -451,6 +515,7 @@ function FlowCanvasInner() {
             if (node.type === "interface") return "#9CA3AF";
             if (node.type === "vpn") return "#14B8A6";
             if (node.type === "apps") return "#3ECF8E";
+            if (node.type === "hotspot") return "#F59E0B";
             return "#4B5563";
           }}
           maskColor="rgba(11, 13, 16, 0.78)"
@@ -472,6 +537,15 @@ function FlowCanvasInner() {
             </p>
           </div>
         </div>
+      )}
+
+      {contextMenu && (
+        <CanvasContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          onAddNode={handleAddNodeFromContextMenu}
+          onClose={() => setContextMenu(null)}
+        />
       )}
     </div>
   );

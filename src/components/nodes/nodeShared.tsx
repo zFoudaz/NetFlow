@@ -11,13 +11,27 @@ export const NETFLOW_DND_MIME = "application/netflow-node";
 
 export const VPN_PROVIDERS: readonly VpnProvider[] = [
   "karing",
+  "nekoRay",
   "openVpn",
 ] as const;
 
 export const VPN_PROVIDER_LABELS: Record<VpnProvider, string> = {
   karing: "Karing",
+  nekoRay: "NekoRay",
   openVpn: "OpenVPN",
 };
+
+export function getConflictingVpnProvider(
+  provider: VpnProvider,
+  nodes: WorkflowNode[]
+): VpnProvider | null {
+  const conflictTarget: VpnProvider | null =
+    provider === "karing" ? "nekoRay" : provider === "nekoRay" ? "karing" : null;
+  if (!conflictTarget) return null;
+  return nodes.some((n) => n.kind.type === "vpn" && n.kind.provider === conflictTarget)
+    ? conflictTarget
+    : null;
+}
 
 export function getInterfaceIcon(alias: string) {
   return /wi-?fi|wlan/i.test(alias) ? Wifi : Network;
@@ -26,6 +40,7 @@ export function getInterfaceIcon(alias: string) {
 export function createDefaultVpnSettings(): VpnNodeSettings {
   return {
     karingPortOverride: null,
+    nekorayPortOverride: null,
     openvpnAdapterOverride: null,
     openvpnServerIpOverride: null,
   };
@@ -34,6 +49,7 @@ export function createDefaultVpnSettings(): VpnNodeSettings {
 export type DragNodePayload =
   | { type: "interface"; interfaceAlias: string }
   | { type: "vpn"; provider: VpnProvider }
+  | { type: "hotspot" }
   | {
       type: "apps";
       label?: string | null;
@@ -54,9 +70,14 @@ export function parseDragNodePayload(raw: string): DragNodePayload | null {
     }
     if (
       record.type === "vpn" &&
-      (record.provider === "karing" || record.provider === "openVpn")
+      (record.provider === "karing" ||
+        record.provider === "openVpn" ||
+        record.provider === "nekoRay")
     ) {
       return { type: "vpn", provider: record.provider };
+    }
+    if (record.type === "hotspot") {
+      return { type: "hotspot" };
     }
     if (record.type === "apps") {
       const result: Extract<DragNodePayload, { type: "apps" }> = { type: "apps" };
@@ -124,6 +145,15 @@ export function createWorkflowNode(
           settings: createDefaultVpnSettings(),
         },
       };
+    case "hotspot":
+      return {
+        id: generateNodeId("hotspot"),
+        x,
+        y,
+        kind: {
+          type: "hotspot",
+        },
+      };
     case "apps": {
       const seen = new Set<string>();
       const apps: string[] = [];
@@ -164,6 +194,7 @@ export function nextQuickAddPosition(
     interface: 60,
     vpn: 360,
     apps: 660,
+    hotspot: 660,
   };
   return {
     x: xByType[nodeType] + (sameKindCount % 2) * 24,

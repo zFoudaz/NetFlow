@@ -10,8 +10,10 @@ use crate::model::{NodeKind, ValidatedGraph, ValidatedVpnChain, VpnProvider};
 use crate::validator::canonicalize_exe_name as canonicalize_validator_exe_name;
 
 const TUN_TAG: &str = "NetFlow-TUN";
-const TUN_INET4_ADDR: &str = "172.19.0.1/30";
+const TUN_INET4_ADDR: &str = "172.29.0.1/30";
 const TUN_INET6_ADDR: &str = "fdfe:dcba:9876::1/126";
+pub const HOTSPOT_TUN_TAG: &str = "NetFlow-Hotspot-TUN";
+const HOTSPOT_TUN_INET4_ADDR: &str = "172.29.1.1/30";
 const FAKEIP_INET4_RANGE: &str = "198.18.0.0/15";
 const DNS_BOOTSTRAP_SERVER: &str = "1.1.1.1";
 const DNS_DEFAULT_TAG: &str = "dns-default";
@@ -35,6 +37,8 @@ const PRIVATE_LAN_CIDRS: [&str; 7] = [
 pub struct ResolvedVpnRuntimeInfo {
     pub provider: VpnProvider,
     pub karing_socks_port: Option<u16>,
+    #[serde(default)]
+    pub nekoray_socks_port: Option<u16>,
     pub openvpn_adapter_alias: Option<String>,
     pub openvpn_server_ip: Option<String>,
 }
@@ -68,6 +72,8 @@ pub enum CompileError {
     MissingVpnRuntime { provider: VpnProvider },
     #[error("missing SOCKS5 port for Karing")]
     MissingKaringPort,
+    #[error("missing SOCKS5 port for NekoRay")]
+    MissingNekoRayPort,
     #[error("missing virtual adapter alias for OpenVPN")]
     MissingOpenVpnAdapterAlias,
     #[error("invalid OpenVPN server IPv4 address '{value}'")]
@@ -116,6 +122,7 @@ pub fn compile_singbox_config(input: &CompileInput) -> Result<CompiledConfig, Co
         LOCAL_DIRECT_TAG.to_string(),
         DEFAULT_DIRECT_TAG.to_string(),
         TUN_TAG.to_string(),
+        HOTSPOT_TUN_TAG.to_string(),
     ]
     .into_iter()
     .collect();
@@ -151,6 +158,18 @@ pub fn compile_singbox_config(input: &CompileInput) -> Result<CompiledConfig, Co
         None => (DEFAULT_DIRECT_TAG.to_string(), true),
     };
 
+    let hotspot_target_outbound = match &input.validated.hotspot_target_node_id {
+        Some(target_id) => {
+            let tag = node_to_outbound.get(target_id).ok_or_else(|| {
+                CompileError::UnknownNodeReference {
+                    node_id: target_id.clone(),
+                }
+            })?;
+            Some(tag.clone())
+        }
+        None => None,
+    };
+
     let default_iface_bind_ipv4 = lookup_bind_ipv4(&input.interface_ipv4s, default_iface);
     let dns_final_tag =
         resolve_dns_final_tag(&final_outbound_tag, &interface_outbounds, &vpn_outbounds);
@@ -163,8 +182,9 @@ pub fn compile_singbox_config(input: &CompileInput) -> Result<CompiledConfig, Co
         &interface_outbounds,
         &vpn_outbounds,
         dns_final_tag,
+        hotspot_target_outbound.as_deref(),
     );
-    let inbounds_section = build_inbounds_section();
+    let inbounds_section = build_inbounds_section(hotspot_target_outbound.is_some());
     let outbounds_section = build_outbounds_section(
         default_iface,
         default_iface_bind_ipv4.as_deref(),
@@ -178,6 +198,7 @@ pub fn compile_singbox_config(input: &CompileInput) -> Result<CompiledConfig, Co
         &vpn_outbounds,
         &final_outbound_tag,
         dns_final_tag,
+        hotspot_target_outbound.as_deref(),
     )?;
 
     let cache_path = input.log_path.with_file_name("cache.db");
@@ -284,6 +305,15 @@ fn build_vpn_outbounds(
                     .ok_or(CompileError::MissingKaringPort)?;
                 (VpnOutboundKind::Socks { port }, None)
             }
+            VpnProvider::NekoRay => {
+                let port = chain
+                    .settings
+                    .nekoray_port_override
+                    .or(runtime.nekoray_socks_port)
+                    .filter(|p| *p != 0)
+                    .ok_or(CompileError::MissingNekoRayPort)?;
+                (VpnOutboundKind::Socks { port }, None)
+            }
             VpnProvider::OpenVpn => {
                 let alias = non_empty_trimmed(chain.settings.openvpn_adapter_override.as_deref())
                     .or_else(|| non_empty_trimmed(runtime.openvpn_adapter_alias.as_deref()))
@@ -374,6 +404,7 @@ fn build_dns_section(
     interface_outbounds: &[InterfaceOutbound],
     vpn_outbounds: &[ResolvedVpnOutbound],
     dns_final_tag: &str,
+    hotspot_target_outbound: Option<&str>,
 ) -> Value {
     let mut default_dns = json!({
         "type": "udp",
@@ -446,6 +477,16 @@ fn build_dns_section(
         }));
     }
 
+    if let Some(target_outbound) = hotspot_target_outbound {
+        let hotspot_dns_tag =
+            resolve_dns_final_tag(target_outbound, interface_outbounds, vpn_outbounds);
+        rules.push(json!({
+            "inbound": [HOTSPOT_TUN_TAG],
+            "action": "route",
+            "server": hotspot_dns_tag
+        }));
+    }
+
     rules.push(json!({
         "query_type": ["A"],
         "action": "route",
@@ -460,18 +501,28 @@ fn build_dns_section(
     })
 }
 
-fn build_inbounds_section() -> Value {
-    json!([
-        {
+fn build_inbounds_section(include_hotspot: bool) -> Value {
+    let mut inbounds = vec![json!({
+        "type": "tun",
+        "tag": TUN_TAG,
+        "interface_name": TUN_TAG,
+        "address": [TUN_INET4_ADDR, TUN_INET6_ADDR],
+        "auto_route": true,
+        "strict_route": true,
+        "stack": "mixed"
+    })];
+    if include_hotspot {
+        inbounds.push(json!({
             "type": "tun",
-            "tag": TUN_TAG,
-            "interface_name": TUN_TAG,
-            "address": [TUN_INET4_ADDR, TUN_INET6_ADDR],
-            "auto_route": true,
-            "strict_route": true,
+            "tag": HOTSPOT_TUN_TAG,
+            "interface_name": HOTSPOT_TUN_TAG,
+            "address": [HOTSPOT_TUN_INET4_ADDR],
+            "auto_route": false,
+            "strict_route": false,
             "stack": "mixed"
-        }
-    ])
+        }));
+    }
+    Value::Array(inbounds)
 }
 
 fn build_outbounds_section(
@@ -550,6 +601,7 @@ fn build_route_section(
     vpn_outbounds: &[ResolvedVpnOutbound],
     final_outbound_tag: &str,
     dns_final_tag: &str,
+    hotspot_target_outbound: Option<&str>,
 ) -> Result<Value, CompileError> {
     // 1. Sniff -> 2. DNS Hijack -> 3. IPv6 Reject -> 4. Private LAN Direct (excluding FakeIP)
     let mut rules = vec![
@@ -584,6 +636,14 @@ fn build_route_section(
                 "outbound": upstream_tag
             }));
         }
+    }
+
+    if let Some(target_tag) = hotspot_target_outbound {
+        rules.push(json!({
+            "inbound": [HOTSPOT_TUN_TAG],
+            "action": "route",
+            "outbound": target_tag
+        }));
     }
 
     // 6. Connected Apps rules grouped deterministically by target outbound tag
@@ -625,12 +685,14 @@ fn vpn_outbound_tag(provider: VpnProvider) -> &'static str {
     match provider {
         VpnProvider::Karing => "vpn-karing",
         VpnProvider::OpenVpn => "vpn-openvpn",
+        VpnProvider::NekoRay => "vpn-nekoray",
     }
 }
 
 fn outer_tunnel_processes(provider: VpnProvider) -> &'static [&'static str] {
     match provider {
         VpnProvider::Karing => &["karingservice.exe", "karing.exe"],
+        VpnProvider::NekoRay => &["nekobox_core.exe", "nekoray_core.exe", "nekoray.exe"],
         VpnProvider::OpenVpn => &[
             "openvpn.exe",
             "ovpnconnector.exe",
@@ -800,6 +862,17 @@ mod tests {
         ResolvedVpnRuntimeInfo {
             provider: VpnProvider::Karing,
             karing_socks_port: Some(port),
+            nekoray_socks_port: None,
+            openvpn_adapter_alias: None,
+            openvpn_server_ip: None,
+        }
+    }
+
+    fn nekoray_runtime(port: u16) -> ResolvedVpnRuntimeInfo {
+        ResolvedVpnRuntimeInfo {
+            provider: VpnProvider::NekoRay,
+            karing_socks_port: None,
+            nekoray_socks_port: Some(port),
             openvpn_adapter_alias: None,
             openvpn_server_ip: None,
         }
@@ -809,6 +882,7 @@ mod tests {
         ResolvedVpnRuntimeInfo {
             provider: VpnProvider::OpenVpn,
             karing_socks_port: None,
+            nekoray_socks_port: None,
             openvpn_adapter_alias: Some(alias.to_string()),
             openvpn_server_ip: server_ip.map(|s| s.to_string()),
         }
@@ -819,6 +893,62 @@ mod tests {
         rule.get("process_path_regex")
             .and_then(|v| v.as_array())
             .is_some_and(|arr| arr.iter().any(|item| item.as_str() == Some(expected_regex.as_str())))
+    }
+
+    #[test]
+    fn test_compiles_nekoray_socks_and_outer_tunnel_rules() {
+        let graph = WorkflowGraph {
+            nodes: vec![
+                iface_node("if-wifi", "Wi-Fi", false),
+                vpn_node("vpn-neko", VpnProvider::NekoRay, false),
+                apps_node("apps-neko", &["chrome.exe"]),
+            ],
+            edges: vec![
+                edge("e1", "if-wifi", "vpn-neko"),
+                edge("e2", "vpn-neko", "apps-neko"),
+            ],
+        };
+
+        let validated = validate_graph(&graph).expect("graph should validate");
+        let mut vpn_runtime = HashMap::new();
+        vpn_runtime.insert(VpnProvider::NekoRay, nekoray_runtime(2080));
+
+        let compiled = compile_singbox_config(&CompileInput {
+            validated,
+            default_physical_interface: "Wi-Fi".to_string(),
+            interface_ipv4s: HashMap::new(),
+            vpn_runtime,
+            clash_api_port: 9090,
+            log_path: PathBuf::from("sing-box.log"),
+        })
+        .expect("compile should succeed");
+
+        let outbounds = compiled.json["outbounds"].as_array().expect("outbounds");
+        let neko_outbound = outbounds
+            .iter()
+            .find(|o| o["tag"] == "vpn-nekoray")
+            .expect("vpn-nekoray outbound");
+        assert_eq!(neko_outbound["type"], "socks");
+        assert_eq!(neko_outbound["server"], "127.0.0.1");
+        assert_eq!(neko_outbound["server_port"], 2080);
+
+        let rules = compiled.json["route"]["rules"].as_array().expect("rules");
+        let neko_outer = rules
+            .iter()
+            .find(|r| {
+                rule_has_process(r, "nekobox_core.exe")
+                    && rule_has_process(r, "nekoray_core.exe")
+                    && rule_has_process(r, "nekoray.exe")
+            })
+            .expect("nekoray outer tunnel rule");
+        assert_eq!(neko_outer["outbound"], "iface-wi-fi");
+
+        let dns_rules = compiled.json["dns"]["rules"].as_array().expect("dns rules");
+        assert!(dns_rules.iter().any(|r| {
+            rule_has_process(r, "nekobox_core.exe")
+                && rule_has_process(r, "nekoray_core.exe")
+                && r["server"] == "dns-iface-wi-fi"
+        }));
     }
 
     #[test]
@@ -866,7 +996,7 @@ mod tests {
         assert_eq!(inbound["interface_name"], "NetFlow-TUN");
         assert_eq!(
             inbound["address"],
-            serde_json::json!(["172.19.0.1/30", "fdfe:dcba:9876::1/126"])
+            serde_json::json!(["172.29.0.1/30", "fdfe:dcba:9876::1/126"])
         );
         assert_eq!(inbound["auto_route"], true);
         assert_eq!(inbound["strict_route"], true);
@@ -1347,6 +1477,7 @@ mod tests {
             ResolvedVpnRuntimeInfo {
                 provider: VpnProvider::Karing,
                 karing_socks_port: None,
+                nekoray_socks_port: None,
                 openvpn_adapter_alias: None,
                 openvpn_server_ip: None,
             },
@@ -1592,5 +1723,66 @@ mod tests {
         for srv in dns_servers {
             assert!(srv.get("inet4_bind_address").is_none());
         }
+    }
+
+    #[test]
+    fn test_compiles_hotspot_tun_inbound_dns_and_route_and_passes_singbox_check() {
+        let graph = WorkflowGraph {
+            nodes: vec![
+                iface_node("if-wifi", "Wi-Fi", true),
+                vpn_node("vpn-karing", VpnProvider::Karing, false),
+                WorkflowNode {
+                    id: "hs-1".to_string(),
+                    x: 0.0,
+                    y: 0.0,
+                    kind: NodeKind::Hotspot {},
+                },
+            ],
+            edges: vec![
+                edge("e1", "if-wifi", "vpn-karing"),
+                edge("e2", "vpn-karing", "hs-1"),
+            ],
+        };
+
+        let validated = validate_graph(&graph).expect("graph should validate");
+        let mut vpn_runtime = HashMap::new();
+        vpn_runtime.insert(VpnProvider::Karing, karing_runtime(3067));
+
+        let compiled = compile_singbox_config(&CompileInput {
+            validated,
+            default_physical_interface: "Wi-Fi".to_string(),
+            interface_ipv4s: HashMap::new(),
+            vpn_runtime,
+            clash_api_port: 9090,
+            log_path: PathBuf::from("sing-box.log"),
+        })
+        .expect("hotspot compile should succeed");
+
+        let inbounds = compiled.json["inbounds"].as_array().expect("inbounds");
+        assert_eq!(inbounds.len(), 2);
+        let hs_inbound = inbounds
+            .iter()
+            .find(|i| i["tag"] == HOTSPOT_TUN_TAG)
+            .expect("hotspot tun inbound");
+        assert_eq!(hs_inbound["address"], serde_json::json!(["172.29.1.1/30"]));
+        assert_eq!(hs_inbound["auto_route"], false);
+
+        let dns_rules = compiled.json["dns"]["rules"].as_array().expect("dns.rules");
+        let hs_dns = dns_rules
+            .iter()
+            .find(|r| r["inbound"] == serde_json::json!([HOTSPOT_TUN_TAG]))
+            .expect("hotspot dns rule");
+        assert_eq!(hs_dns["server"], "dns-iface-wi-fi");
+
+        let route_rules = compiled.json["route"]["rules"]
+            .as_array()
+            .expect("route.rules");
+        let hs_route = route_rules
+            .iter()
+            .find(|r| r["inbound"] == serde_json::json!([HOTSPOT_TUN_TAG]))
+            .expect("hotspot route rule");
+        assert_eq!(hs_route["outbound"], "vpn-karing");
+
+        assert_passes_real_singbox_check(&compiled.json);
     }
 }

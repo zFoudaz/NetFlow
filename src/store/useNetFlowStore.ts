@@ -170,6 +170,7 @@ export interface NetFlowStoreState {
   engineStatus: EngineStatus;
   liveConnections: LiveConnection[];
   isTrafficDrawerOpen: boolean;
+  isPropertiesPanelOpen: boolean;
   recoveryNotice: string | null;
   uiError: string | null;
   isApplying: boolean;
@@ -218,6 +219,7 @@ export interface NetFlowStoreState {
 
   setLiveConnections: (connections: LiveConnection[]) => void;
   toggleTrafficDrawer: () => void;
+  setPropertiesPanelOpen: (open: boolean) => void;
   setSelectedNodeId: (nodeId: string | null) => void;
   requestFitView: () => void;
   dismissRecoveryNotice: () => void;
@@ -291,6 +293,7 @@ export const useNetFlowStore = create<NetFlowStoreState>((set, get) => ({
   engineStatus: { ...INITIAL_ENGINE_STATUS },
   liveConnections: [],
   isTrafficDrawerOpen: false,
+  isPropertiesPanelOpen: true,
   recoveryNotice: null,
   uiError: null,
   isApplying: false,
@@ -853,8 +856,15 @@ export const useNetFlowStore = create<NetFlowStoreState>((set, get) => ({
     set((state) => ({ isTrafficDrawerOpen: !state.isTrafficDrawerOpen }));
   },
 
+  setPropertiesPanelOpen: (open) => {
+    set({ isPropertiesPanelOpen: open });
+  },
+
   setSelectedNodeId: (nodeId) => {
-    set({ selectedNodeId: nodeId });
+    set((state) => ({
+      selectedNodeId: nodeId,
+      isPropertiesPanelOpen: nodeId !== null ? true : state.isPropertiesPanelOpen,
+    }));
   },
 
   requestFitView: () => {
@@ -932,6 +942,7 @@ export const useNetFlowStore = create<NetFlowStoreState>((set, get) => ({
       engineStatus: { ...INITIAL_ENGINE_STATUS },
       liveConnections: [],
       isTrafficDrawerOpen: false,
+      isPropertiesPanelOpen: true,
       recoveryNotice: null,
       uiError: null,
       isApplying: false,

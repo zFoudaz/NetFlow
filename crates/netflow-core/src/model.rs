@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub enum VpnProvider {
     Karing,
     OpenVpn,
+    NekoRay,
 }
 
 /// Provider-specific overrides configured on a VPN node.
@@ -15,6 +16,7 @@ pub enum VpnProvider {
 #[serde(rename_all = "camelCase", default)]
 pub struct VpnNodeSettings {
     pub karing_port_override: Option<u16>,
+    pub nekoray_port_override: Option<u16>,
     pub openvpn_adapter_override: Option<String>,
     pub openvpn_server_ip_override: Option<String>,
 }
@@ -43,6 +45,7 @@ pub enum NodeKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         icon_data_url: Option<String>,
     },
+    Hotspot {},
 }
 
 /// A positioned node inside the visual workflow graph.
@@ -89,6 +92,8 @@ pub enum ValidationErrorCode {
     CycleDetected,
     MissingUpstreamInterface,
     DuplicateVpnProvider,
+    ConflictingVpnProviders,
+    DuplicateHotspotNode,
     MultipleUpstreams,
     MultipleDefaults,
     DuplicateAppAssignment,
@@ -141,4 +146,6 @@ pub struct ValidatedGraph {
     pub vpn_by_provider: HashMap<VpnProvider, ValidatedVpnChain>,
     pub app_routes: HashMap<String, AppRouteAssignment>,
     pub default_node_id: Option<String>,
+    #[serde(default)]
+    pub hotspot_target_node_id: Option<String>,
 }

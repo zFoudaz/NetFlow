@@ -10,7 +10,7 @@ use netflow_core::autostart::{AutoStartManager, WindowsTaskSchedulerAutoStart};
 use netflow_core::discovery::{SystemDiscovery, Win32Discovery};
 use netflow_core::recovery::{default_recovery_path, RecoveryStore};
 use netflow_core::runtime::{
-    EngineRuntime, EngineRuntimeConfig, RuntimeEvent, SidecarRunner, SingBoxSidecar,
+    EngineRuntime, EngineRuntimeConfig, RuntimeEvent, RuntimeState, SidecarRunner, SingBoxSidecar,
 };
 use netflow_core::settings::{default_settings_path, SettingsStore};
 use netflow_core::storage::{default_workflows_dir, WorkflowStore};
@@ -64,6 +64,47 @@ fn initiate_clean_exit(app_handle: AppHandle) {
     });
 }
 
+fn is_connected_state(state: RuntimeState) -> bool {
+    matches!(state, RuntimeState::Active | RuntimeState::Warning)
+}
+
+fn to_grayscale_icon(icon: &tauri::image::Image<'_>) -> tauri::image::Image<'static> {
+    let src = icon.rgba();
+    let mut dst = Vec::with_capacity(src.len());
+    for px in src.chunks_exact(4) {
+        let luma = ((u32::from(px[0]) * 299 + u32::from(px[1]) * 587 + u32::from(px[2]) * 114)
+            / 1000) as u8;
+        dst.extend_from_slice(&[luma, luma, luma, px[3]]);
+    }
+    tauri::image::Image::new_owned(dst, icon.width(), icon.height())
+}
+
+fn update_app_icons(app_handle: &AppHandle, state: RuntimeState) {
+    let Some(default_icon) = app_handle.default_window_icon() else {
+        return;
+    };
+    let connected = is_connected_state(state);
+    let icon = if connected {
+        default_icon.to_owned()
+    } else {
+        to_grayscale_icon(default_icon)
+    };
+
+    if let Some(tray) = app_handle.tray_by_id(TRAY_ID) {
+        let _ = tray.set_icon(Some(icon.clone()));
+        let tooltip = if connected {
+            "NetFlow — Connected"
+        } else {
+            "NetFlow — Disconnected"
+        };
+        let _ = tray.set_tooltip(Some(tooltip));
+    }
+
+    if let Some(window) = app_handle.get_webview_window("main") {
+        let _ = window.set_icon(icon);
+    }
+}
+
 fn spawn_event_forwarder(
     app_handle: AppHandle,
     runtime: Arc<EngineRuntime>,
@@ -73,6 +114,7 @@ fn spawn_event_forwarder(
         loop {
             match event_rx.recv().await {
                 Ok(RuntimeEvent::StatusChanged(status)) => {
+                    update_app_icons(&app_handle, status.state);
                     let _ = app_handle.emit(EVENT_STATUS, status);
                 }
                 Ok(RuntimeEvent::TrafficUpdated(connections)) => {
@@ -85,7 +127,9 @@ fn spawn_event_forwarder(
                     let _ = app_handle.emit(EVENT_RECOVERY_NOTICE, notice);
                 }
                 Err(RecvError::Lagged(_)) => {
-                    let _ = app_handle.emit(EVENT_STATUS, runtime.status());
+                    let status = runtime.status();
+                    update_app_icons(&app_handle, status.state);
+                    let _ = app_handle.emit(EVENT_STATUS, status);
                 }
                 Err(RecvError::Closed) => break,
             }
@@ -107,7 +151,7 @@ fn build_system_tray(app: &tauri::App) -> tauri::Result<()> {
 
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .menu(&menu)
-        .tooltip("NetFlow")
+        .tooltip("NetFlow — Disconnected")
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             TRAY_SHOW_ID => show_main_window(app),
@@ -137,8 +181,8 @@ fn build_system_tray(app: &tauri::App) -> tauri::Result<()> {
             _ => {}
         });
 
-    if let Some(icon) = app.default_window_icon().cloned() {
-        builder = builder.icon(icon);
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(to_grayscale_icon(icon));
     }
 
     builder.build(app)?;
@@ -193,6 +237,7 @@ pub fn run() {
             app.manage(app_state);
             spawn_event_forwarder(app.handle().clone(), runtime, event_rx);
             build_system_tray(app)?;
+            update_app_icons(app.handle(), RuntimeState::Stopped);
 
             if autostart_launch {
                 let app_handle = app.handle().clone();
@@ -261,4 +306,36 @@ pub fn run() {
         }
         _ => {}
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_connected_state() {
+        assert!(!is_connected_state(RuntimeState::Stopped));
+        assert!(!is_connected_state(RuntimeState::Applying));
+        assert!(!is_connected_state(RuntimeState::Error));
+        assert!(is_connected_state(RuntimeState::Active));
+        assert!(is_connected_state(RuntimeState::Warning));
+    }
+
+    #[test]
+    fn test_to_grayscale_icon_preserves_alpha_and_dimensions() {
+        // 2x1 RGBA image: green/teal pixel + transparent pixel
+        let rgba = vec![62, 207, 142, 255, 20, 184, 166, 0];
+        let icon = tauri::image::Image::new(&rgba, 2, 1);
+        let gray = to_grayscale_icon(&icon);
+
+        assert_eq!(gray.width(), 2);
+        assert_eq!(gray.height(), 1);
+        let out = gray.rgba();
+        assert_eq!(out[0], out[1]);
+        assert_eq!(out[1], out[2]);
+        assert_eq!(out[3], 255);
+        assert_eq!(out[4], out[5]);
+        assert_eq!(out[5], out[6]);
+        assert_eq!(out[7], 0);
+    }
 }

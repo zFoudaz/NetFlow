@@ -96,6 +96,24 @@ pub trait WindowsNetworkOps: Send + Sync {
 
     /// Disables Windows System Proxy (`ProxyEnable = 0`) and broadcasts WinINet refresh.
     fn disable_system_proxy(&self) -> Result<(), NetOpsError>;
+
+    /// Configures Windows ICS to share `public_alias` (`NetFlow-Hotspot-TUN`) to `private_alias`.
+    fn configure_hotspot_ics(
+        &self,
+        _public_alias: &str,
+        _private_alias: &str,
+    ) -> Result<Option<String>, NetOpsError> {
+        Ok(None)
+    }
+
+    /// Restores Windows ICS sharing state when stopping or removing the Mobile Hotspot node.
+    fn restore_hotspot_ics(
+        &self,
+        _previous_public_alias: Option<&str>,
+        _private_alias: &str,
+    ) -> Result<(), NetOpsError> {
+        Ok(())
+    }
 }
 
 /// Real Win32 implementation of [`WindowsNetworkOps`].
@@ -167,6 +185,22 @@ impl WindowsNetworkOps for Win32NetworkOps {
 
     fn disable_system_proxy(&self) -> Result<(), NetOpsError> {
         platform::disable_system_proxy()
+    }
+
+    fn configure_hotspot_ics(
+        &self,
+        public_alias: &str,
+        private_alias: &str,
+    ) -> Result<Option<String>, NetOpsError> {
+        platform::configure_hotspot_ics(public_alias, private_alias)
+    }
+
+    fn restore_hotspot_ics(
+        &self,
+        previous_public_alias: Option<&str>,
+        private_alias: &str,
+    ) -> Result<(), NetOpsError> {
+        platform::restore_hotspot_ics(previous_public_alias, private_alias)
     }
 }
 
@@ -287,6 +321,8 @@ pub(crate) fn parse_ip_addr(addr: &str, is_ipv6: bool) -> Result<IpKind, NetOpsE
 pub(crate) mod platform {
     use std::ffi::c_void;
     use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
     use std::ptr;
 
     use windows::core::{HRESULT, PCWSTR};
@@ -992,6 +1028,144 @@ pub(crate) mod platform {
         reg_write_dword(key.0, "ProxyEnable", 0)?;
         broadcast_wininet_proxy_refresh()
     }
+
+    const CREATE_NO_WINDOW_FLAG: u32 = 0x0800_0000;
+
+    fn run_ics_powershell(script: &str, envs: &[(&str, &str)]) -> Result<String, NetOpsError> {
+        let mut cmd = Command::new("powershell.exe");
+        cmd.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            script,
+        ])
+        .creation_flags(CREATE_NO_WINDOW_FLAG);
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        let output = cmd
+            .output()
+            .map_err(|e| NetOpsError::Io(format!("failed to launch powershell for ICS: {e}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let detail = if stderr.is_empty() { stdout } else { stderr };
+            return Err(NetOpsError::Io(format!("Windows ICS configuration failed: {detail}")));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    pub(crate) fn configure_hotspot_ics(
+        public_alias: &str,
+        private_alias: &str,
+    ) -> Result<Option<String>, NetOpsError> {
+        const SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+Start-Service SharedAccess -ErrorAction SilentlyContinue
+$pub = $env:NETFLOW_ICS_PUBLIC
+$priv = $env:NETFLOW_ICS_PRIVATE
+$prevPub = ''
+$lastErr = $null
+for ($attempt = 0; $attempt -lt 3; $attempt++) {
+  try {
+    $m = New-Object -ComObject HNetCfg.HNetShare
+    $conns = @($m.EnumEveryConnection)
+    $pubCfg = $null
+    $privCfg = $null
+    $sharedCfgs = @()
+    foreach ($c in $conns) {
+      $p = $m.NetConnectionProps($c)
+      if ($null -eq $p) { continue }
+      $cfg = $m.INetSharingConfigurationForINetConnection($c)
+      if ($p.Name -eq $pub) { $pubCfg = $cfg }
+      if ($p.Name -eq $priv) { $privCfg = $cfg }
+      if ($cfg.SharingEnabled) {
+        if ($cfg.SharingConnectionType -eq 0 -and $p.Name -ne $pub -and -not $prevPub) {
+          $prevPub = $p.Name
+        }
+        $sharedCfgs += $cfg
+      }
+    }
+    if ($null -eq $pubCfg) { throw "ICS public adapter '$pub' not found" }
+    if ($null -eq $privCfg) { throw "ICS private adapter '$priv' not found" }
+    if ($pubCfg.SharingEnabled -and $pubCfg.SharingConnectionType -eq 0 -and $privCfg.SharingEnabled -and $privCfg.SharingConnectionType -eq 1) {
+      $lastErr = $null
+      break
+    }
+    foreach ($sc in $sharedCfgs) {
+      $sc.DisableSharing()
+    }
+    if ($sharedCfgs.Count -gt 0) {
+      Start-Sleep -Milliseconds 200
+    }
+    $pubCfg.EnableSharing(0)
+    $privCfg.EnableSharing(1)
+    $lastErr = $null
+    break
+  } catch {
+    $lastErr = $_
+    if ($attempt -lt 2) {
+      Start-Sleep -Milliseconds 500
+    }
+  }
+}
+if ($null -ne $lastErr) { throw $lastErr }
+Write-Output $prevPub
+"#;
+        let out = run_ics_powershell(
+            SCRIPT,
+            &[
+                ("NETFLOW_ICS_PUBLIC", public_alias),
+                ("NETFLOW_ICS_PRIVATE", private_alias),
+            ],
+        )?;
+        Ok(if out.is_empty() { None } else { Some(out) })
+    }
+
+    pub(crate) fn restore_hotspot_ics(
+        previous_public_alias: Option<&str>,
+        private_alias: &str,
+    ) -> Result<(), NetOpsError> {
+        const SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+$m = New-Object -ComObject HNetCfg.HNetShare
+$priv = $env:NETFLOW_ICS_PRIVATE
+$prevPub = $env:NETFLOW_ICS_PREV_PUBLIC
+$conns = @($m.EnumEveryConnection)
+foreach ($c in $conns) {
+  $p = $m.NetConnectionProps($c)
+  if ($null -eq $p) { continue }
+  $cfg = $m.INetSharingConfigurationForINetConnection($c)
+  if ($cfg.SharingEnabled) {
+    try { $cfg.DisableSharing() } catch {}
+  }
+}
+if ($prevPub) {
+  Start-Sleep -Milliseconds 200
+  foreach ($c in $conns) {
+    $p = $m.NetConnectionProps($c)
+    if ($null -eq $p) { continue }
+    $cfg = $m.INetSharingConfigurationForINetConnection($c)
+    if ($p.Name -eq $prevPub) { $cfg.EnableSharing(0) }
+    elseif ($p.Name -eq $priv) { $cfg.EnableSharing(1) }
+  }
+}
+"#;
+        let _ = run_ics_powershell(
+            SCRIPT,
+            &[
+                ("NETFLOW_ICS_PUBLIC", "NetFlow-Hotspot-TUN"),
+                ("NETFLOW_ICS_PRIVATE", private_alias),
+                (
+                    "NETFLOW_ICS_PREV_PUBLIC",
+                    previous_public_alias.unwrap_or(""),
+                ),
+            ],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(not(windows))]
@@ -1049,6 +1223,20 @@ pub(crate) mod platform {
     }
 
     pub(crate) fn disable_system_proxy() -> Result<(), NetOpsError> {
+        Err(NetOpsError::UnsupportedPlatform)
+    }
+
+    pub(crate) fn configure_hotspot_ics(
+        _: &str,
+        _: &str,
+    ) -> Result<Option<String>, NetOpsError> {
+        Err(NetOpsError::UnsupportedPlatform)
+    }
+
+    pub(crate) fn restore_hotspot_ics(
+        _: Option<&str>,
+        _: &str,
+    ) -> Result<(), NetOpsError> {
         Err(NetOpsError::UnsupportedPlatform)
     }
 }

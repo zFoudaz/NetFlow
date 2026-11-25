@@ -4,7 +4,10 @@ import {
   BookmarkPlus,
   CheckCircle2,
   Info,
+  PanelRightClose,
+  PanelRightOpen,
   Plus,
+  Radio,
   Save,
   Shield,
   SlidersHorizontal,
@@ -26,6 +29,7 @@ import {
 function formatNodeName(node: WorkflowNode): string {
   if (node.kind.type === "interface") return node.kind.interfaceAlias;
   if (node.kind.type === "vpn") return VPN_PROVIDER_LABELS[node.kind.provider];
+  if (node.kind.type === "hotspot") return "Mobile Hotspot";
   const label = node.kind.label?.trim() || "Connected Apps";
   return `${label} (${node.kind.apps.length})`;
 }
@@ -50,7 +54,26 @@ export function PropertiesPanel() {
   const validateCurrentGraph = useNetFlowStore((s) => s.validateCurrentGraph);
   const saveCurrentWorkflow = useNetFlowStore((s) => s.saveCurrentWorkflow);
 
+  const isPropertiesPanelOpen = useNetFlowStore((s) => s.isPropertiesPanelOpen);
+  const setPropertiesPanelOpen = useNetFlowStore((s) => s.setPropertiesPanelOpen);
+
   const [addModalOpen, setAddModalOpen] = useState(false);
+
+  if (!isPropertiesPanelOpen) {
+    return (
+      <div className="relative w-0 shrink-0">
+        <button
+          type="button"
+          aria-label="Show right sidebar"
+          title="Show right sidebar"
+          onClick={() => setPropertiesPanelOpen(true)}
+          className="absolute top-2.5 right-2.5 z-20 inline-flex h-8 w-8 items-center justify-center rounded-md border border-[#232830] bg-[#111418]/95 text-[#9CA3AF] shadow-md transition hover:border-[#2E3540] hover:bg-[#1D222B] hover:text-[#F3F4F6]"
+        >
+          <PanelRightOpen className="h-4 w-4" />
+        </button>
+      </div>
+    );
+  }
 
   const selectedNode = selectedNodeId
     ? graph.nodes.find((n) => n.id === selectedNodeId)
@@ -71,6 +94,15 @@ export function PropertiesPanel() {
           <span className="text-xs font-semibold uppercase tracking-wider text-[#9CA3AF]">
             Workflow Info
           </span>
+          <button
+            type="button"
+            aria-label="Hide right sidebar"
+            title="Hide right sidebar"
+            onClick={() => setPropertiesPanelOpen(false)}
+            className="ml-auto rounded p-1 text-[#6B7280] transition hover:bg-[#1D222B] hover:text-[#F3F4F6]"
+          >
+            <PanelRightClose className="h-3.5 w-3.5" />
+          </button>
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto">
@@ -185,6 +217,7 @@ export function PropertiesPanel() {
       removeNode={removeNode}
       addModalOpen={addModalOpen}
       setAddModalOpen={setAddModalOpen}
+      onHide={() => setPropertiesPanelOpen(false)}
     />
   );
 }
@@ -218,6 +251,7 @@ interface NodeInspectorProps {
   removeNode: (nodeId: string) => void;
   addModalOpen: boolean;
   setAddModalOpen: (open: boolean) => void;
+  onHide: () => void;
 }
 
 function defaultRouteHint(isDefault: boolean, isApplying: boolean, isRoutingActive: boolean): string {
@@ -249,6 +283,7 @@ function NodeInspector({
   removeNode,
   addModalOpen,
   setAddModalOpen,
+  onHide,
 }: NodeInspectorProps) {
   const { nodeErrors, isDropped, errorTooltip } = useNodeDiagnostics(node.id);
   const [groupSavedOk, setGroupSavedOk] = useState(false);
@@ -267,6 +302,15 @@ function NodeInspector({
         <span className="text-xs font-semibold uppercase tracking-wider text-[#9CA3AF]">
           Node Properties
         </span>
+        <button
+          type="button"
+          aria-label="Hide right sidebar"
+          title="Hide right sidebar"
+          onClick={onHide}
+          className="ml-auto rounded p-1 text-[#6B7280] transition hover:bg-[#1D222B] hover:text-[#F3F4F6]"
+        >
+          <PanelRightClose className="h-3.5 w-3.5" />
+        </button>
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
@@ -432,6 +476,18 @@ function NodeInspector({
             }
           };
 
+          const handleNekoRayPortChange = (raw: string) => {
+            const trimmed = raw.trim();
+            if (!trimmed) {
+              updateVpnSettings(node.id, { nekorayPortOverride: null });
+              return;
+            }
+            const parsed = Number.parseInt(trimmed, 10);
+            if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 65535) {
+              updateVpnSettings(node.id, { nekorayPortOverride: parsed });
+            }
+          };
+
           const downstreamAppsNodes = graph.edges
             .filter((e) => e.source === node.id)
             .map((e) => graph.nodes.find((n) => n.id === e.target))
@@ -509,7 +565,7 @@ function NodeInspector({
                     <dt className="text-[#9CA3AF]">Provider</dt>
                     <dd className="text-[#F3F4F6]">{providerLabel}</dd>
                   </div>
-                  {provider === "karing" ? (
+                  {provider === "karing" || provider === "nekoRay" ? (
                     <div className="flex items-center justify-between gap-2">
                       <dt className="text-[#9CA3AF]">Detected Port</dt>
                       <dd className="font-mono text-[#F3F4F6]">
@@ -553,6 +609,25 @@ function NodeInspector({
                         vpnInfo?.detectedPort
                           ? `Detected (${vpnInfo.detectedPort})`
                           : "Auto-detect port"
+                      }
+                      className="w-full rounded-md border border-[#232830] bg-[#0B0D10] px-2.5 py-1.5 text-xs text-[#F3F4F6] placeholder-[#6B7280] outline-none focus:border-[#3ECF8E]"
+                    />
+                  </label>
+                )}
+
+                {provider === "nekoRay" && (
+                  <label className="block space-y-1">
+                    <span className="text-xs text-[#9CA3AF]">SOCKS5 Port Override</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={65535}
+                      value={settings.nekorayPortOverride ?? ""}
+                      onChange={(e) => handleNekoRayPortChange(e.target.value)}
+                      placeholder={
+                        vpnInfo?.detectedPort
+                          ? `Detected (${vpnInfo.detectedPort})`
+                          : "Auto-detect port (2080)"
                       }
                       className="w-full rounded-md border border-[#232830] bg-[#0B0D10] px-2.5 py-1.5 text-xs text-[#F3F4F6] placeholder-[#6B7280] outline-none focus:border-[#3ECF8E]"
                     />
@@ -801,6 +876,116 @@ function NodeInspector({
                 onAddApp={handleAddApp}
                 onClose={() => setAddModalOpen(false)}
               />
+            </>
+          );
+        })()}
+
+        {node.kind.type === "hotspot" && (() => {
+          const hotspot = discovery.hotspot;
+          const isActive = Boolean(hotspot?.isActive);
+          const incomingEdge = graph.edges.find((e) => e.target === node.id);
+          const currentUpstreamId = incomingEdge?.source ?? "";
+          const upstreamCandidates = graph.nodes.filter(
+            (n) => n.kind.type === "interface" || n.kind.type === "vpn"
+          );
+
+          const handleUpstreamChange = (nextSourceId: string) => {
+            const withoutIncoming = graph.edges.filter((e) => e.target !== node.id);
+            if (!nextSourceId) {
+              updateGraph(graph.nodes, withoutIncoming);
+              return;
+            }
+            const nextEdge = {
+              id: `edge-${nextSourceId}-${node.id}-${Date.now()}`,
+              source: nextSourceId,
+              target: node.id,
+            };
+            updateGraph(graph.nodes, [...withoutIncoming, nextEdge]);
+          };
+
+          return (
+            <>
+              <section className="border-b border-[#232830] px-4 py-3.5">
+                <div className="flex items-center gap-2.5">
+                  <Radio
+                    className={`h-5 w-5 shrink-0 ${
+                      isActive ? "text-amber-400" : "text-[#6B7280]"
+                    }`}
+                  />
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-semibold text-[#F3F4F6]">
+                      Mobile Hotspot
+                    </div>
+                    <div className="mt-0.5 flex items-center gap-1.5 text-xs">
+                      <span
+                        className={`h-1.5 w-1.5 rounded-full ${
+                          isActive ? "bg-[#3ECF8E]" : "bg-[#6B7280]"
+                        }`}
+                      />
+                      <span className={isActive ? "text-[#3ECF8E]" : "text-[#9CA3AF]"}>
+                        {isActive ? "Active" : "Off"}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+                <NodeErrorCallout errors={nodeErrors} tooltip={errorTooltip} />
+              </section>
+
+              <section className="border-b border-[#232830] px-4 py-3.5">
+                <label className="block space-y-1.5">
+                  <span className="text-[11px] font-medium uppercase tracking-wider text-[#6B7280]">
+                    Upstream Network
+                  </span>
+                  <select
+                    aria-label="Hotspot Upstream Network"
+                    value={currentUpstreamId}
+                    onChange={(e) => handleUpstreamChange(e.target.value)}
+                    className="w-full rounded-md border border-[#232830] bg-[#161A20] px-2.5 py-1.5 text-xs text-[#F3F4F6] outline-none focus:border-[#3ECF8E]"
+                  >
+                    <option value="">None (Unlinked)</option>
+                    {upstreamCandidates.map((candidate) => (
+                      <option key={candidate.id} value={candidate.id}>
+                        {formatNodeName(candidate)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <p className="mt-2 text-[11px] leading-relaxed text-[#6B7280]">
+                  Enable Windows Mobile Hotspot in Windows Settings; NetFlow routes all
+                  hotspot clients through the connected Interface or VPN.
+                </p>
+              </section>
+
+              <section className="border-b border-[#232830] px-4 py-3.5">
+                <div className="mb-2 text-[11px] font-medium uppercase tracking-wider text-[#6B7280]">
+                  Hotspot Adapter
+                </div>
+                <dl className="space-y-1.5 text-xs">
+                  <div className="flex items-center justify-between gap-2">
+                    <dt className="text-[#9CA3AF]">Adapter</dt>
+                    <dd className="truncate font-mono text-[#F3F4F6]">
+                      {hotspot?.adapterAlias ?? "Not detected"}
+                    </dd>
+                  </div>
+                  <div className="flex items-center justify-between gap-2">
+                    <dt className="text-[#9CA3AF]">IPv4</dt>
+                    <dd className="font-mono text-[#F3F4F6]">
+                      {hotspot?.ipv4 ?? "—"}
+                    </dd>
+                  </div>
+                </dl>
+              </section>
+
+              <div className="px-4 py-3.5">
+                <button
+                  type="button"
+                  onClick={() => removeNode(node.id)}
+                  className="inline-flex w-full items-center justify-center gap-1.5 rounded-md border border-rose-500/35 bg-rose-500/10 px-3 py-1.5 text-xs font-medium text-rose-300 transition hover:bg-rose-500/20"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                  Remove Hotspot
+                </button>
+              </div>
             </>
           );
         })()}

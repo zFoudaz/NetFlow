@@ -66,6 +66,15 @@ pub struct DetectedAppInfo {
     pub icon_data_url: Option<String>,
 }
 
+/// Live detection state for Windows Mobile Hotspot sharing adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectedHotspotInfo {
+    pub is_active: bool,
+    pub adapter_alias: Option<String>,
+    pub ipv4: Option<String>,
+}
+
 /// Complete read-only snapshot of Windows interfaces, VPN providers, and running processes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -75,6 +84,8 @@ pub struct DiscoverySnapshot {
     pub processes: Vec<RunningProcessInfo>,
     #[serde(default)]
     pub open_apps: Vec<DetectedAppInfo>,
+    #[serde(default)]
+    pub hotspot: Option<DetectedHotspotInfo>,
 }
 
 /// Typed errors returned by [`SystemDiscovery`] implementations.
@@ -136,6 +147,8 @@ impl SystemDiscovery for Win32Discovery {
             &running_exe_set,
             &interfaces,
         );
+        let nekoray = detect_nekoray(&raw_adapters, &ipv4_routes, &running_exe_set, &ports_by_exe);
+        let hotspot = detect_hotspot(&raw_adapters);
         let open_apps = group_open_apps(
             &raw_processes,
             &visible_pids,
@@ -145,9 +158,10 @@ impl SystemDiscovery for Win32Discovery {
 
         Ok(DiscoverySnapshot {
             interfaces,
-            vpns: vec![karing, openvpn],
+            vpns: vec![karing, openvpn, nekoray],
             processes,
             open_apps,
+            hotspot: Some(hotspot),
         })
     }
 }
@@ -189,6 +203,10 @@ fn is_openvpn_adapter(alias: &str, description: &str) -> bool {
     contains_any_ci(alias, description, &["openvpn", "tap-windows"])
 }
 
+fn is_nekoray_adapter(alias: &str, description: &str) -> bool {
+    contains_any_ci(alias, description, &["nekoray", "nekobox"])
+}
+
 pub(crate) fn is_virtual_or_excluded_adapter(
     alias: &str,
     description: &str,
@@ -204,7 +222,10 @@ pub(crate) fn is_virtual_or_excluded_adapter(
         &[
             "loopback",
             "netflow-tun",
+            "netflow-hotspot-tun",
             "karing",
+            "nekoray",
+            "nekobox",
             "openvpn",
             "tap-windows",
             "vethernet",
@@ -338,6 +359,18 @@ pub(crate) fn pick_karing_mixed_port(ports: &[u16]) -> Option<u16> {
         .iter()
         .copied()
         .find(|&p| p != 0 && !CONTROL_PORTS.contains(&p))
+}
+
+/// Picks NekoRay / NekoBox's SOCKS5 listening port, preferring `2080` and skipping HTTP/control ports.
+pub(crate) fn pick_nekoray_socks_port(ports: &[u16]) -> Option<u16> {
+    const SKIP_PORTS: [u16; 2] = [2081, 9090];
+    if ports.contains(&2080) {
+        return Some(2080);
+    }
+    ports
+        .iter()
+        .copied()
+        .find(|&p| p != 0 && !SKIP_PORTS.contains(&p))
 }
 
 /// Extracts OpenVPN's remote server IPv4 from a `/32` host route routed via a physical gateway.
@@ -478,6 +511,63 @@ fn detect_karing(
         adapter_is_up,
         adapter_gateway: resolve_adapter_gateway(adapter, ipv4_routes),
         remote_server_ip: None,
+    }
+}
+
+fn detect_nekoray(
+    adapters: &[RawAdapterInfo],
+    ipv4_routes: &[RouteRecord],
+    running_exe_set: &HashSet<String>,
+    ports_by_exe: &HashMap<String, Vec<u16>>,
+) -> DetectedVpnInfo {
+    let process_running = has_any_process(
+        running_exe_set,
+        &["nekobox_core.exe", "nekoray_core.exe", "nekoray.exe"],
+    );
+    let adapter = find_matching_adapter(adapters, is_nekoray_adapter);
+    let adapter_is_up = adapter.is_some_and(|a| a.is_up);
+    let detected_port = ports_by_exe
+        .get("nekobox_core.exe")
+        .and_then(|ports| pick_nekoray_socks_port(ports))
+        .or_else(|| {
+            ports_by_exe
+                .get("nekoray_core.exe")
+                .and_then(|ports| pick_nekoray_socks_port(ports))
+        })
+        .or_else(|| {
+            ports_by_exe
+                .get("nekoray.exe")
+                .and_then(|ports| pick_nekoray_socks_port(ports))
+        });
+    let is_running = process_running && detected_port.is_some();
+
+    DetectedVpnInfo {
+        provider: VpnProvider::NekoRay,
+        is_running,
+        detected_port,
+        adapter_alias: adapter.map(|a| a.alias.clone()),
+        adapter_if_index: adapter.map(|a| a.if_index),
+        adapter_is_up,
+        adapter_gateway: resolve_adapter_gateway(adapter, ipv4_routes),
+        remote_server_ip: None,
+    }
+}
+
+pub(crate) fn detect_hotspot(adapters: &[RawAdapterInfo]) -> DetectedHotspotInfo {
+    let adapter = adapters
+        .iter()
+        .filter(|a| {
+            a.ipv4.as_deref() == Some("192.168.137.1")
+                || a.description
+                    .to_ascii_lowercase()
+                    .contains("wi-fi direct virtual")
+        })
+        .max_by_key(|a| (a.is_up, a.ipv4.as_deref() == Some("192.168.137.1")));
+
+    DetectedHotspotInfo {
+        is_active: adapter.is_some_and(|a| a.is_up),
+        adapter_alias: adapter.map(|a| a.alias.clone()),
+        ipv4: adapter.and_then(|a| a.ipv4.clone()),
     }
 }
 
@@ -2045,15 +2135,17 @@ mod tests {
             !snapshot.processes.is_empty(),
             "expected non-empty running process list on Windows"
         );
-        assert_eq!(snapshot.vpns.len(), 2);
+        assert_eq!(snapshot.vpns.len(), 3);
         assert!(snapshot.vpns.iter().any(|v| v.provider == VpnProvider::Karing));
         assert!(snapshot.vpns.iter().any(|v| v.provider == VpnProvider::OpenVpn));
+        assert!(snapshot.vpns.iter().any(|v| v.provider == VpnProvider::NekoRay));
 
         for iface in &snapshot.interfaces {
             let lower = iface.alias.to_ascii_lowercase();
             assert!(!lower.contains("loopback"));
             assert!(!lower.contains("netflow-tun"));
             assert!(!lower.contains("karing"));
+            assert!(!lower.contains("nekoray"));
             assert!(!lower.contains("openvpn"));
             assert!(!lower.contains("vethernet"));
         }

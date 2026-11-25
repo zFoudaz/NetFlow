@@ -1,10 +1,19 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { Activity, ArrowDown, ArrowUp, ArrowUpDown, Search, X } from "lucide-react";
 import { useNetFlowStore } from "../store/useNetFlowStore";
 import type { LiveConnection, WorkflowNode } from "../types/workflow";
 import { VPN_PROVIDER_LABELS } from "./nodes/nodeShared";
 
 const BYTE_UNITS = ["B", "KB", "MB", "GB", "TB"] as const;
+const DEFAULT_DRAWER_HEIGHT = 256;
+const MIN_DRAWER_HEIGHT = 140;
+
+function clampDrawerHeight(height: number): number {
+  const viewportHeight =
+    typeof window !== "undefined" && window.innerHeight > 0 ? window.innerHeight : 800;
+  const maxHeight = Math.max(MIN_DRAWER_HEIGHT, Math.floor(viewportHeight * 0.75));
+  return Math.min(maxHeight, Math.max(MIN_DRAWER_HEIGHT, Math.round(height)));
+}
 
 /** Formats a byte count into a human-readable string (B, KB, MB, GB, TB). */
 export function formatBytes(bytes: number): string {
@@ -85,10 +94,51 @@ export function LiveTrafficDrawer() {
   const toggleTrafficDrawer = useNetFlowStore((s) => s.toggleTrafficDrawer);
 
   const [filterQuery, setFilterQuery] = useState("");
+  const [drawerHeight, setDrawerHeight] = useState(DEFAULT_DRAWER_HEIGHT);
+  const [isResizing, setIsResizing] = useState(false);
+  const dragStateRef = useRef<{ startY: number; startHeight: number } | null>(null);
   const [sortConfig, setSortConfig] = useState<{
     key: SortKey;
     direction: SortDirection;
   } | null>(null);
+
+  useEffect(() => {
+    if (!isResizing) {
+      return;
+    }
+
+    const prevCursor = document.body.style.cursor;
+    const prevUserSelect = document.body.style.userSelect;
+    document.body.style.cursor = "row-resize";
+    document.body.style.userSelect = "none";
+
+    const handleMouseMove = (event: MouseEvent) => {
+      if (!dragStateRef.current) return;
+      const deltaY = dragStateRef.current.startY - event.clientY;
+      setDrawerHeight(clampDrawerHeight(dragStateRef.current.startHeight + deltaY));
+    };
+
+    const handleMouseUp = () => {
+      dragStateRef.current = null;
+      setIsResizing(false);
+    };
+
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
+
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+      document.body.style.cursor = prevCursor;
+      document.body.style.userSelect = prevUserSelect;
+    };
+  }, [isResizing]);
+
+  const handleResizeStart = (event: ReactMouseEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    dragStateRef.current = { startY: event.clientY, startHeight: drawerHeight };
+    setIsResizing(true);
+  };
 
   const handleSort = (key: SortKey) => {
     setSortConfig((prev) => {
@@ -239,8 +289,26 @@ export function LiveTrafficDrawer() {
   return (
     <section
       aria-label="Live Traffic Log"
-      className="flex h-64 shrink-0 flex-col border-t border-[#232830] bg-[#111418] text-[#F3F4F6]"
+      style={{ height: `${drawerHeight}px` }}
+      className="flex shrink-0 flex-col border-t border-[#232830] bg-[#111418] text-[#F3F4F6]"
     >
+      <div
+        role="separator"
+        aria-orientation="horizontal"
+        aria-label="Resize Live Traffic drawer"
+        title="Drag to resize (double-click to reset)"
+        onMouseDown={handleResizeStart}
+        onDoubleClick={() => setDrawerHeight(DEFAULT_DRAWER_HEIGHT)}
+        className={`group flex h-1.5 w-full shrink-0 cursor-row-resize items-center justify-center transition-colors ${
+          isResizing ? "bg-[#3ECF8E]/40" : "hover:bg-[#3ECF8E]/25"
+        }`}
+      >
+        <div
+          className={`h-0.5 w-10 rounded-full transition-colors ${
+            isResizing ? "bg-[#3ECF8E]" : "bg-[#2E3540] group-hover:bg-[#3ECF8E]"
+          }`}
+        />
+      </div>
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#232830] px-4 py-2">
         <div className="flex items-center gap-2">
           <Activity className="h-4 w-4 text-[#3ECF8E]" />

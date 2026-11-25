@@ -216,30 +216,37 @@ describe("FlowCanvas, Sidebar, and Custom Nodes", () => {
 
     render(<Sidebar />);
 
-    // Interfaces section with live Up/Down badges and IPv4
+    // Interfaces section with live Up/Down indicator dots
     const wifiItem = screen.getByTestId("sidebar-interface-Wi-Fi");
     expect(within(wifiItem).getByText("Wi-Fi")).toBeTruthy();
-    expect(within(wifiItem).getByText("Up")).toBeTruthy();
-    expect(within(wifiItem).getByText("192.168.1.42")).toBeTruthy();
+    expect(within(wifiItem).getByLabelText("Up")).toBeTruthy();
 
     const ethItem = screen.getByTestId("sidebar-interface-Ethernet");
     expect(within(ethItem).getByText("Ethernet")).toBeTruthy();
-    expect(within(ethItem).getByText("Down")).toBeTruthy();
+    expect(within(ethItem).getByLabelText("Down")).toBeTruthy();
 
-    // Both supported VPNs render with live Running/Stopped status
+    // Supported VPNs render with compact status dots/badges
     const karingItem = screen.getByTestId("sidebar-vpn-karing");
     expect(within(karingItem).getByText("Karing")).toBeTruthy();
-    expect(within(karingItem).getByText("Running")).toBeTruthy();
-    expect(within(karingItem).getByText("On Canvas")).toBeTruthy();
+    expect(within(karingItem).getByLabelText("Running")).toBeTruthy();
     expect(karingItem.getAttribute("draggable")).toBe("false");
     expect(within(karingItem).getByRole("button", { name: /Add Karing VPN/i })).toHaveProperty(
       "disabled",
       true
     );
 
+    const nekoRayItem = screen.getByTestId("sidebar-vpn-nekoRay");
+    expect(within(nekoRayItem).getByText("NekoRay")).toBeTruthy();
+    expect(within(nekoRayItem).getByLabelText("Blocked by Karing")).toBeTruthy();
+    expect(nekoRayItem.getAttribute("draggable")).toBe("false");
+    expect(within(nekoRayItem).getByRole("button", { name: /Add NekoRay VPN/i })).toHaveProperty(
+      "disabled",
+      true
+    );
+
     const openVpnItem = screen.getByTestId("sidebar-vpn-openVpn");
     expect(within(openVpnItem).getByText("OpenVPN")).toBeTruthy();
-    expect(within(openVpnItem).getByText("Stopped")).toBeTruthy();
+    expect(within(openVpnItem).getByLabelText("Stopped")).toBeTruthy();
     expect(openVpnItem.getAttribute("draggable")).toBe("true");
 
     // Connected Apps template card is draggable
@@ -251,15 +258,28 @@ describe("FlowCanvas, Sidebar, and Custom Nodes", () => {
     await user.click(screen.getByRole("button", { name: /Refresh discovery/i }));
     expect(mockTauri.getDiscoverySnapshot).toHaveBeenCalledTimes(1);
 
-    // Quick-add button adds OpenVPN to canvas and marks it On Canvas
+    // Quick-add button adds OpenVPN to canvas and disables adding again
     await user.click(within(openVpnItem).getByRole("button", { name: /Add OpenVPN VPN/i }));
     expect(
       useNetFlowStore
         .getState()
         .graph.nodes.some((n) => n.kind.type === "vpn" && n.kind.provider === "openVpn")
     ).toBe(true);
-    expect(within(openVpnItem).getByText("On Canvas")).toBeTruthy();
+    expect(within(openVpnItem).getByRole("button", { name: /Add OpenVPN VPN/i })).toHaveProperty(
+      "disabled",
+      true
+    );
     expect(openVpnItem.getAttribute("draggable")).toBe("false");
+
+    // Collapse button switches sidebar to icon-only mode and Expand restores labels
+    await user.click(screen.getByRole("button", { name: /Collapse sidebar/i }));
+    expect(screen.queryByText(/Network Interfaces/i)).toBeNull();
+    expect(screen.queryByText("Wi-Fi")).toBeNull();
+    expect(screen.getByTestId("sidebar-interface-Wi-Fi")).toBeTruthy();
+
+    await user.click(screen.getByRole("button", { name: /Expand sidebar/i }));
+    expect(screen.getByText(/Network Interfaces/i)).toBeTruthy();
+    expect(screen.getByText("Wi-Fi")).toBeTruthy();
   });
 
   it("test_apps_node_adds_and_removes_exe_via_modal", async () => {
@@ -907,7 +927,7 @@ describe("FlowCanvas, Sidebar, and Custom Nodes", () => {
 
     const discordRow = screen.getByTestId("sidebar-open-app-app-discord");
     expect(within(discordRow).getByText("Discord")).toBeTruthy();
-    expect(within(discordRow).getByText("discord.exe +1")).toBeTruthy();
+    expect(discordRow.getAttribute("title")).toContain("discord.exe");
     expect(discordRow.querySelector("img")?.getAttribute("src")).toBe(iconUrl);
 
     // Filter Running Apps by executable or display name
@@ -929,7 +949,10 @@ describe("FlowCanvas, Sidebar, and Custom Nodes", () => {
       apps: ["discord.exe", "update.exe"],
       iconDataUrl: iconUrl,
     });
-    expect(within(discordRow).getByText("On Canvas")).toBeTruthy();
+    expect(within(discordRow).getByRole("button", { name: /Add Discord app/i })).toHaveProperty(
+      "disabled",
+      true
+    );
     expect(discordRow.getAttribute("draggable")).toBe("false");
 
     const canvasCard = await screen.findByTestId(`flow-node-${createdNode!.id}`);
@@ -970,5 +993,90 @@ describe("FlowCanvas, Sidebar, and Custom Nodes", () => {
     await waitFor(() => {
       expect(container.querySelector('[data-testid="sidebar-saved-group-grp-browsers"]')).toBeNull();
     });
+  });
+
+  it("opens a node context menu on right-click, filters nodes, adds a node, and closes on Escape", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<FlowCanvas />);
+
+    const pane = container.querySelector(".react-flow__pane") as HTMLElement;
+    expect(pane).toBeTruthy();
+
+    fireEvent.contextMenu(pane, { clientX: 220, clientY: 180 });
+    const menu = await screen.findByRole("menu", { name: /Add node menu/i });
+    expect(menu).toBeTruthy();
+
+    // Search filters down to Ethernet and hides Karing
+    const searchInput = within(menu).getByLabelText("Search nodes to add");
+    await user.type(searchInput, "Ethernet");
+    expect(within(menu).queryByRole("menuitem", { name: /Karing/i })).toBeNull();
+
+    await user.click(within(menu).getByRole("menuitem", { name: /Ethernet/i }));
+    expect(screen.queryByRole("menu", { name: /Add node menu/i })).toBeNull();
+    expect(
+      useNetFlowStore
+        .getState()
+        .graph.nodes.some((n) => n.kind.type === "interface" && n.kind.interfaceAlias === "Ethernet")
+    ).toBe(true);
+
+    // Re-open menu and verify Escape closes it
+    fireEvent.contextMenu(pane, { clientX: 240, clientY: 200 });
+    expect(await screen.findByRole("menu", { name: /Add node menu/i })).toBeTruthy();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("menu", { name: /Add node menu/i })).toBeNull();
+  });
+
+  it("adds Mobile Hotspot from Sidebar and allows wiring to an Interface or VPN", async () => {
+    const user = userEvent.setup();
+    useNetFlowStore.setState({
+      discovery: {
+        ...sampleDiscovery,
+        hotspot: {
+          isActive: true,
+          adapterAlias: "Local Area Connection* 2",
+          ipv4: "192.168.137.1",
+        },
+      },
+      graph: {
+        nodes: [
+          {
+            id: "iface-wifi",
+            x: 80,
+            y: 120,
+            kind: { type: "interface", interfaceAlias: "Wi-Fi", isDefault: true },
+          },
+        ],
+        edges: [],
+      },
+    });
+
+    render(
+      <>
+        <Sidebar />
+        <FlowCanvas />
+        <PropertiesPanel />
+      </>
+    );
+
+    const hotspotItem = screen.getByTestId("sidebar-hotspot");
+    expect(within(hotspotItem).getByText("Mobile Hotspot")).toBeTruthy();
+    await user.click(within(hotspotItem).getByRole("button", { name: /Add Mobile Hotspot node/i }));
+
+    const hsNode = useNetFlowStore.getState().graph.nodes.find((n) => n.kind.type === "hotspot");
+    expect(hsNode).toBeTruthy();
+    expect(within(hotspotItem).getByRole("button", { name: /Add Mobile Hotspot node/i })).toHaveProperty(
+      "disabled",
+      true
+    );
+
+    const inspector = await screen.findByLabelText("Node Properties");
+    const select = within(inspector).getByLabelText("Hotspot Upstream Network");
+    await user.selectOptions(select, "iface-wifi");
+
+    expect(
+      useNetFlowStore
+        .getState()
+        .graph.edges.some((e) => e.source === "iface-wifi" && e.target === hsNode!.id)
+    ).toBe(true);
   });
 });

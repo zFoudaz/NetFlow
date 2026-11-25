@@ -47,7 +47,9 @@ export function VpnNode({ data, selected }: NodeProps<VpnFlowNode>) {
   const endpointDetail =
     provider === "karing"
       ? `Port ${settings.karingPortOverride ?? vpnInfo?.detectedPort ?? "Auto"}`
-      : settings.openvpnAdapterOverride || vpnInfo?.adapterAlias || "TAP / Wintun";
+      : provider === "nekoRay"
+        ? `Port ${settings.nekorayPortOverride ?? vpnInfo?.detectedPort ?? "Auto"}`
+        : settings.openvpnAdapterOverride || vpnInfo?.adapterAlias || "TAP / Wintun";
 
   return (
     <div

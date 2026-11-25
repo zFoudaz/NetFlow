@@ -77,6 +77,12 @@ pub fn validate_graph(graph: &WorkflowGraph) -> Result<ValidatedGraph, Vec<Valid
         &incoming,
         &mut errors,
     );
+    let hotspot_target_node_id = validate_hotspot(
+        &indexed.node_order,
+        &indexed.nodes_by_id,
+        &incoming,
+        &mut errors,
+    );
 
     if !errors.is_empty() {
         return Err(errors);
@@ -97,6 +103,7 @@ pub fn validate_graph(graph: &WorkflowGraph) -> Result<ValidatedGraph, Vec<Valid
         vpn_by_provider,
         app_routes,
         default_node_id: indexed.default_node_id,
+        hotspot_target_node_id,
     })
 }
 
@@ -127,6 +134,7 @@ fn index_nodes(graph: &WorkflowGraph, errors: &mut Vec<ValidationError>) -> Inde
     let mut node_index = HashMap::new();
     let mut interface_node_ids = Vec::new();
     let mut vpn_by_provider: HashMap<VpnProvider, Vec<String>> = HashMap::new();
+    let mut hotspot_ids = Vec::new();
     let mut default_node_ids = Vec::new();
 
     for node in &graph.nodes {
@@ -177,18 +185,44 @@ fn index_nodes(graph: &WorkflowGraph, errors: &mut Vec<ValidationError>) -> Inde
                 }
             }
             NodeKind::Apps { .. } => {}
+            NodeKind::Hotspot {} => {
+                hotspot_ids.push(node.id.clone());
+            }
         }
     }
 
-    for (provider, ids) in vpn_by_provider {
+    if hotspot_ids.len() > 1 {
+        push_error(
+            errors,
+            ValidationErrorCode::DuplicateHotspotNode,
+            hotspot_ids,
+            "At most one Mobile Hotspot node is allowed per workflow",
+        );
+    }
+
+    for (provider, ids) in &vpn_by_provider {
         if ids.len() > 1 {
             push_error(
                 errors,
                 ValidationErrorCode::DuplicateVpnProvider,
-                ids,
+                ids.clone(),
                 format!("Duplicate VPN provider '{provider:?}' is not allowed"),
             );
         }
+    }
+
+    if let (Some(karing_ids), Some(nekoray_ids)) = (
+        vpn_by_provider.get(&VpnProvider::Karing),
+        vpn_by_provider.get(&VpnProvider::NekoRay),
+    ) {
+        let mut combined = karing_ids.clone();
+        combined.extend(nekoray_ids.iter().cloned());
+        push_error(
+            errors,
+            ValidationErrorCode::ConflictingVpnProviders,
+            combined,
+            "Karing and NekoRay cannot be used together in the same workflow; pair either one with OpenVPN instead",
+        );
     }
 
     let default_node_id = if default_node_ids.len() > 1 {
@@ -243,12 +277,17 @@ fn build_adjacency(
             continue;
         };
 
-        if matches!(source_node.kind, NodeKind::Apps { .. }) {
+        if matches!(source_node.kind, NodeKind::Apps { .. } | NodeKind::Hotspot {}) {
+            let label = if matches!(source_node.kind, NodeKind::Hotspot {}) {
+                "Mobile Hotspot"
+            } else {
+                "Apps"
+            };
             push_error(
                 errors,
                 ValidationErrorCode::InvalidEdgeDirection,
                 vec![edge.source.clone(), edge.target.clone()],
-                format!("Apps node '{}' cannot have outgoing edges", edge.source),
+                format!("{label} node '{}' cannot have outgoing edges", edge.source),
             );
             continue;
         }
@@ -398,7 +437,7 @@ fn can_reach_apps(
         if let Some(children) = outgoing.get(&cur) {
             for child in children {
                 if let Some(node) = nodes_by_id.get(child) {
-                    if matches!(node.kind, NodeKind::Apps { .. }) {
+                    if matches!(node.kind, NodeKind::Apps { .. } | NodeKind::Hotspot {}) {
                         return true;
                     }
                     if visited.insert(child.clone()) {
@@ -516,6 +555,38 @@ fn validate_apps(
     }
 
     app_routes
+}
+
+fn validate_hotspot(
+    node_order: &[String],
+    nodes_by_id: &HashMap<String, WorkflowNode>,
+    incoming: &AdjacencyMap,
+    errors: &mut Vec<ValidationError>,
+) -> Option<String> {
+    let mut target_node_id = None;
+
+    for id in node_order {
+        let Some(node) = nodes_by_id.get(id) else {
+            continue;
+        };
+        if !matches!(node.kind, NodeKind::Hotspot {}) {
+            continue;
+        }
+
+        let parents = incoming.get(id).map(Vec::as_slice).unwrap_or(&[]);
+        if parents.is_empty() {
+            push_error(
+                errors,
+                ValidationErrorCode::MissingUpstreamInterface,
+                vec![id.clone()],
+                "Mobile Hotspot node requires an upstream Interface or VPN node",
+            );
+        } else if parents.len() == 1 && target_node_id.is_none() {
+            target_node_id = Some(parents[0].clone());
+        }
+    }
+
+    target_node_id
 }
 
 fn build_vpn_chains(
@@ -661,6 +732,15 @@ mod tests {
         }
     }
 
+    fn hotspot_node(id: &str) -> WorkflowNode {
+        WorkflowNode {
+            id: id.to_string(),
+            x: 0.0,
+            y: 0.0,
+            kind: NodeKind::Hotspot {},
+        }
+    }
+
     fn edge(id: &str, source: &str, target: &str) -> WorkflowEdge {
         WorkflowEdge {
             id: id.to_string(),
@@ -800,6 +880,111 @@ mod tests {
         assert!(errors
             .iter()
             .any(|e| e.code == ValidationErrorCode::DuplicateVpnProvider));
+    }
+
+    #[test]
+    fn test_rejects_karing_and_nekoray_together_but_allows_nekoray_with_openvpn() {
+        let conflicting = WorkflowGraph {
+            nodes: vec![
+                iface_node("if-wifi", "Wi-Fi", false),
+                iface_node("if-eth", "Ethernet", false),
+                vpn_node("vpn-karing", VpnProvider::Karing, false),
+                vpn_node("vpn-neko", VpnProvider::NekoRay, false),
+            ],
+            edges: vec![
+                edge("e1", "if-wifi", "vpn-karing"),
+                edge("e2", "if-eth", "vpn-neko"),
+            ],
+        };
+        let errs = validate_graph(&conflicting).expect_err("karing + nekoray should fail");
+        assert!(errs
+            .iter()
+            .any(|e| e.code == ValidationErrorCode::ConflictingVpnProviders));
+
+        let allowed = WorkflowGraph {
+            nodes: vec![
+                iface_node("if-wifi", "Wi-Fi", false),
+                iface_node("if-eth", "Ethernet", false),
+                vpn_node("vpn-neko", VpnProvider::NekoRay, false),
+                vpn_node("vpn-ovpn", VpnProvider::OpenVpn, false),
+            ],
+            edges: vec![
+                edge("e1", "if-wifi", "vpn-neko"),
+                edge("e2", "if-eth", "vpn-ovpn"),
+            ],
+        };
+        assert!(validate_graph(&allowed).is_ok());
+    }
+
+    #[test]
+    fn test_validates_hotspot_node_and_rejects_invalid_hotspot_wiring() {
+        let valid_direct = WorkflowGraph {
+            nodes: vec![iface_node("if-wifi", "Wi-Fi", true), hotspot_node("hs-1")],
+            edges: vec![edge("e1", "if-wifi", "hs-1")],
+        };
+        let validated_direct = validate_graph(&valid_direct).expect("interface -> hotspot valid");
+        assert_eq!(
+            validated_direct.hotspot_target_node_id.as_deref(),
+            Some("if-wifi")
+        );
+
+        let valid_vpn = WorkflowGraph {
+            nodes: vec![
+                iface_node("if-wifi", "Wi-Fi", false),
+                vpn_node("vpn-karing", VpnProvider::Karing, false),
+                hotspot_node("hs-1"),
+            ],
+            edges: vec![
+                edge("e1", "if-wifi", "vpn-karing"),
+                edge("e2", "vpn-karing", "hs-1"),
+            ],
+        };
+        let validated_vpn = validate_graph(&valid_vpn).expect("interface -> vpn -> hotspot valid");
+        assert_eq!(
+            validated_vpn.hotspot_target_node_id.as_deref(),
+            Some("vpn-karing")
+        );
+
+        let unwired = WorkflowGraph {
+            nodes: vec![iface_node("if-wifi", "Wi-Fi", true), hotspot_node("hs-1")],
+            edges: vec![],
+        };
+        let unwired_errs = validate_graph(&unwired).expect_err("unwired hotspot must fail");
+        assert!(unwired_errs
+            .iter()
+            .any(|e| e.code == ValidationErrorCode::MissingUpstreamInterface));
+
+        let duplicate = WorkflowGraph {
+            nodes: vec![
+                iface_node("if-wifi", "Wi-Fi", true),
+                hotspot_node("hs-1"),
+                hotspot_node("hs-2"),
+            ],
+            edges: vec![
+                edge("e1", "if-wifi", "hs-1"),
+                edge("e2", "if-wifi", "hs-2"),
+            ],
+        };
+        let dup_errs = validate_graph(&duplicate).expect_err("duplicate hotspot must fail");
+        assert!(dup_errs
+            .iter()
+            .any(|e| e.code == ValidationErrorCode::DuplicateHotspotNode));
+
+        let outgoing = WorkflowGraph {
+            nodes: vec![
+                iface_node("if-wifi", "Wi-Fi", true),
+                hotspot_node("hs-1"),
+                apps_node("apps-1", &["chrome.exe"]),
+            ],
+            edges: vec![
+                edge("e1", "if-wifi", "hs-1"),
+                edge("e2", "hs-1", "apps-1"),
+            ],
+        };
+        let out_errs = validate_graph(&outgoing).expect_err("hotspot outgoing must fail");
+        assert!(out_errs
+            .iter()
+            .any(|e| e.code == ValidationErrorCode::InvalidEdgeDirection));
     }
 
     #[test]
@@ -1001,6 +1186,7 @@ mod tests {
                 is_default: true,
                 settings: VpnNodeSettings {
                     karing_port_override: None,
+                    nekoray_port_override: None,
                     openvpn_adapter_override: Some("OpenVPN Wintun".to_string()),
                     openvpn_server_ip_override: None,
                 },
