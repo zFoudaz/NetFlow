@@ -278,8 +278,10 @@ mod tests {
         let encoded = encode_utf16le_with_bom(sample);
         assert_eq!(&encoded[..2], &[0xFF, 0xFE]);
         let units: Vec<u16> = encoded[2..]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| u16::from_le_bytes(c))
             .collect();
         assert_eq!(String::from_utf16(&units).expect("valid utf-16"), sample);
     }

@@ -71,7 +71,7 @@ fn is_connected_state(state: RuntimeState) -> bool {
 fn to_grayscale_icon(icon: &tauri::image::Image<'_>) -> tauri::image::Image<'static> {
     let src = icon.rgba();
     let mut dst = Vec::with_capacity(src.len());
-    for px in src.chunks_exact(4) {
+    for px in src.as_chunks::<4>().0 {
         let luma = ((u32::from(px[0]) * 299 + u32::from(px[1]) * 587 + u32::from(px[2]) * 114)
             / 1000) as u8;
         dst.extend_from_slice(&[luma, luma, luma, px[3]]);
